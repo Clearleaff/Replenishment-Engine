@@ -39,7 +39,7 @@
         // client want to access resources (aka scopes)
         public static IEnumerable<Client> GetClients(IConfiguration configuration)
         {
-            return new List<Client>
+            var clients = new List<Client>
             {
                 new Client
                 {
@@ -187,6 +187,22 @@
                     }
                 }
             };
+
+            var orderGeneratorSecret = configuration["OrderGenerator:ClientSecret"];
+            if (!string.IsNullOrWhiteSpace(orderGeneratorSecret))
+            {
+                clients.Add(new Client
+                {
+                    ClientId = "order-generator",
+                    ClientName = "Local Order Workload Generator",
+                    AllowedGrantTypes = GrantTypes.ClientCredentials,
+                    ClientSecrets = { new Secret(orderGeneratorSecret.Sha256()) },
+                    AllowedScopes = { "orders" },
+                    AccessTokenLifetime = 10 * 60
+                });
+            }
+
+            return clients;
         }
     }
 }

@@ -30,6 +30,10 @@ internal static class Extensions
 
         services.AddHttpContextAccessor();
         services.AddTransient<IIdentityService, IdentityService>();
+        services.AddOptions<OrderingProcessingOptions>()
+            .BindConfiguration(OrderingProcessingOptions.SectionName)
+            .Validate(options => options.SimulatedDelayMilliseconds >= 0, "SimulatedDelayMilliseconds cannot be negative.")
+            .ValidateOnStart();
 
         // Configure mediatR
         services.AddMediatR(cfg =>

@@ -13,6 +13,12 @@ internal static class Extensions
     public static bool IsFoundryEnabled(IConfiguration configuration) =>
         bool.TryParse(configuration["UseFoundry"], out var useFoundry) && useFoundry;
 
+    public static bool IsOrderGeneratorEnabled(IConfiguration configuration) =>
+        bool.TryParse(configuration["OrderGenerator:Enabled"], out var enabled) && enabled;
+
+    public static bool IsDataPlatformEnabled(IConfiguration configuration) =>
+        bool.TryParse(configuration["DataPlatform:Enabled"], out var enabled) && enabled;
+
     /// <summary>
     /// Adds a hook to set the ASPNETCORE_FORWARDEDHEADERS_ENABLED environment variable to true for all projects in the application.
     /// </summary>

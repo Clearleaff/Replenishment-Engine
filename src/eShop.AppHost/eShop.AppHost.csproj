@@ -15,6 +15,7 @@
     <PackageReference Include="Aspire.Hosting.Redis" />
     <PackageReference Include="Aspire.Hosting.PostgreSQL" />
     <PackageReference Include="Aspire.Hosting.Foundry" />
+    <PackageReference Include="Aspire.Hosting.Kafka" />
     <PackageReference Include="Aspire.Hosting.Yarp" />
     <PackageReference Include="CommunityToolkit.Aspire.Hosting.Ollama" />
   </ItemGroup>
@@ -30,6 +31,7 @@
     <ProjectReference Include="..\Webhooks.API\Webhooks.API.csproj" />
     <ProjectReference Include="..\WebApp\WebApp.csproj" />
     <ProjectReference Include="..\WebhookClient\WebhookClient.csproj" />
+    <ProjectReference Include="..\..\tools\OrderLoadGenerator\OrderLoadGenerator.csproj" />
   </ItemGroup>
 
   <ItemGroup>

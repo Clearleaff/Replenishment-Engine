@@ -27,11 +27,15 @@
     <Project Path="tests/Application.UnitTests/Application.UnitTests.csproj" />
     <Project Path="tests/Catalog.FunctionalTests/Catalog.FunctionalTests.csproj" />
     <Project Path="tests/Inventory.UnitTests/Inventory.UnitTests.csproj" />
+    <Project Path="tests/OrderLoadGenerator.UnitTests/OrderLoadGenerator.UnitTests.csproj" />
     <Project Path="tests/Ordering.FunctionalTests/Ordering.FunctionalTests.csproj" />
     <Project Path="tests/Ordering.UnitTests/Ordering.UnitTests.csproj" />
     <Project Path="tests/Webhooks.FunctionalTests/Webhooks.FunctionalTests.csproj" />
     <Project Path="tests/eShop.AppHost.UnitTests/eShop.AppHost.UnitTests.csproj" />
     <Project Path="tests/ClientApp.UnitTests/ClientApp.UnitTests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/OrderLoadGenerator/OrderLoadGenerator.csproj" />
   </Folder>
   <Folder Name="/Solution Items/">
     <File Path=".editorconfig" />
