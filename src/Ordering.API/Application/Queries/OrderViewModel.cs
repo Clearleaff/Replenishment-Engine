@@ -19,6 +19,7 @@ public record Order
     public string State { get; init; }
     public string Zipcode { get; init; }
     public string Country { get; init; }
+    public string LocationCode { get; init; }
     public List<Orderitem> OrderItems { get; set; }
     public decimal Total { get; set; }
 }
@@ -28,6 +29,7 @@ public record OrderSummary
     public int OrderNumber { get; init; }
     public DateTime Date { get; init; }
     public string Status { get; init; }
+    public string LocationCode { get; init; }
     public double Total { get; init; }
 }
 

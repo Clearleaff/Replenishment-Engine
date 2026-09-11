@@ -6,10 +6,11 @@ public record OrderStatusChangedToAwaitingValidationIntegrationEvent : Integrati
     public OrderStatus OrderStatus { get; }
     public string BuyerName { get; }
     public string BuyerIdentityGuid { get; }
+    public string LocationCode { get; }
     public IEnumerable<OrderStockItem> OrderStockItems { get; }
 
     public OrderStatusChangedToAwaitingValidationIntegrationEvent(
-        int orderId, OrderStatus orderStatus, string buyerName, string buyerIdentityGuid,
+        int orderId, OrderStatus orderStatus, string buyerName, string buyerIdentityGuid, string locationCode,
         IEnumerable<OrderStockItem> orderStockItems)
     {
         OrderId = orderId;
@@ -17,6 +18,7 @@ public record OrderStatusChangedToAwaitingValidationIntegrationEvent : Integrati
         OrderStatus = orderStatus;
         BuyerName = buyerName;
         BuyerIdentityGuid = buyerIdentityGuid;
+        LocationCode = locationCode;
     }
 }
 

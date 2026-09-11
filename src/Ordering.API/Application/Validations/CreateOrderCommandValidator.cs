@@ -13,6 +13,8 @@ public class CreateOrderCommandValidator : AbstractValidator<CreateOrderCommand>
         RuleFor(command => command.CardExpiration).NotEmpty().Must(BeValidExpirationDate).WithMessage("Please specify a valid card expiration date");
         RuleFor(command => command.CardSecurityNumber).NotEmpty().Length(3);
         RuleFor(command => command.CardTypeId).NotEmpty();
+        RuleFor(command => command.LocationCode).Must(code => code?.Trim().ToUpperInvariant() is "NCR" or "BLR" or "BOM" or "HYD")
+            .WithMessage("LocationCode must be NCR, BLR, BOM, or HYD");
         RuleFor(command => command.OrderItems).Must(ContainOrderItems).WithMessage("No order items found");
 
         if (logger.IsEnabled(LogLevel.Trace))

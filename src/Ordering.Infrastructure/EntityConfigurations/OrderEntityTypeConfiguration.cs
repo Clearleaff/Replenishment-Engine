@@ -20,6 +20,12 @@ class OrderEntityTypeConfiguration : IEntityTypeConfiguration<Order>
             .HasConversion<string>()
             .HasMaxLength(30);
 
+        orderConfiguration.Property(o => o.LocationCode)
+            .HasColumnName("LocationCode")
+            .HasMaxLength(16)
+            .HasDefaultValue("NCR")
+            .IsRequired();
+
         orderConfiguration
             .Property(o => o.PaymentId)
             .HasColumnName("PaymentMethodId");

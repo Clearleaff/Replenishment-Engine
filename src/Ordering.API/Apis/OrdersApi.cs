@@ -141,7 +141,7 @@ public static class OrdersApi
             var createOrderCommand = new CreateOrderCommand(request.Items, request.UserId, request.UserName, request.City, request.Street,
                 request.State, request.Country, request.ZipCode,
                 maskedCCNumber, request.CardHolderName, request.CardExpiration,
-                request.CardSecurityNumber, request.CardTypeId);
+                request.CardSecurityNumber, request.CardTypeId, request.LocationCode);
 
             var requestCreateOrder = new IdentifiedCommand<CreateOrderCommand, bool>(createOrderCommand, requestId);
 
@@ -182,4 +182,5 @@ public record CreateOrderRequest(
     string CardSecurityNumber,
     int CardTypeId,
     string Buyer,
-    List<BasketItem> Items);
+    List<BasketItem> Items,
+    string LocationCode = "NCR");

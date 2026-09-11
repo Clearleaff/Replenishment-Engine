@@ -34,6 +34,7 @@ public class OrderStatusChangedToPaidDomainEventHandler : INotificationHandler<O
             order.OrderStatus,
             buyer.Name,
             buyer.IdentityGuid,
+            order.LocationCode,
             orderStockList);
 
         await _orderingIntegrationEventService.AddAndSaveEventAsync(integrationEvent);

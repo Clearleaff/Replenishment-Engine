@@ -16,6 +16,7 @@ var postgres = builder.AddPostgres("postgres")
 var catalogDb = postgres.AddDatabase("catalogdb");
 var identityDb = postgres.AddDatabase("identitydb");
 var orderDb = postgres.AddDatabase("orderingdb");
+var inventoryDb = postgres.AddDatabase("inventorydb");
 var webhooksDb = postgres.AddDatabase("webhooksdb");
 
 var launchProfileName = ShouldUseHttpForEndpoints() ? "http" : "https";
@@ -43,6 +44,11 @@ var orderingApi = builder.AddProject<Projects.Ordering_API>("ordering-api")
     .WithReference(orderDb).WaitFor(orderDb)
     .WithHttpHealthCheck("/health")
     .WithEnvironment("Identity__Url", identityEndpoint);
+
+var inventoryApi = builder.AddProject<Projects.Inventory_API>("inventory-api")
+    .WithReference(rabbitMq).WaitFor(rabbitMq)
+    .WithReference(inventoryDb).WaitFor(inventoryDb)
+    .WithHttpHealthCheck("/health");
 
 builder.AddProject<Projects.OrderProcessor>("order-processor")
     .WithReference(rabbitMq).WaitFor(rabbitMq)

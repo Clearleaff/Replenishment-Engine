@@ -175,4 +175,15 @@ public class OrderAggregateTest
         //Assert
         Assert.HasCount(expectedResult, fakeOrder.DomainEvents);
     }
+
+    [TestMethod]
+    public void Order_normalizes_and_rejects_distribution_center_codes()
+    {
+        var address = new AddressBuilder().Build();
+        var order = new Order("1", "buyer", address, 1, "12", "123", "Buyer", DateTime.UtcNow.AddYears(1), locationCode: " blr ");
+
+        Assert.AreEqual("BLR", order.LocationCode);
+        Assert.ThrowsExactly<OrderingDomainException>(() =>
+            new Order("1", "buyer", address, 1, "12", "123", "Buyer", DateTime.UtcNow.AddYears(1), locationCode: "UNKNOWN"));
+    }
 }

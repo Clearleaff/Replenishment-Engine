@@ -3,9 +3,9 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
-using eShop.Catalog.API.Infrastructure;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using Pgvector;
+using eShop.Catalog.API.Infrastructure;
 
 #nullable disable
 
@@ -18,7 +18,7 @@ namespace eShop.Catalog.API.Infrastructure.Migrations
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "8.0.0-rtm.23512.13")
+                .HasAnnotation("ProductVersion", "10.0.11")
                 .HasAnnotation("Relational:MaxIdentifierLength", 63);
 
             NpgsqlModelBuilderExtensions.HasPostgresExtension(modelBuilder, "vector");
@@ -50,9 +50,6 @@ namespace eShop.Catalog.API.Infrastructure.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
 
-                    b.Property<int>("AvailableStock")
-                        .HasColumnType("integer");
-
                     b.Property<int>("CatalogBrandId")
                         .HasColumnType("integer");
 
@@ -65,25 +62,16 @@ namespace eShop.Catalog.API.Infrastructure.Migrations
                     b.Property<Vector>("Embedding")
                         .HasColumnType("vector(384)");
 
-                    b.Property<int>("MaxStockThreshold")
-                        .HasColumnType("integer");
-
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasMaxLength(50)
                         .HasColumnType("character varying(50)");
-
-                    b.Property<bool>("OnReorder")
-                        .HasColumnType("boolean");
 
                     b.Property<string>("PictureFileName")
                         .HasColumnType("text");
 
                     b.Property<decimal>("Price")
                         .HasColumnType("numeric");
-
-                    b.Property<int>("RestockThreshold")
-                        .HasColumnType("integer");
 
                     b.HasKey("Id");
 
