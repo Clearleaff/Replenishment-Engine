@@ -37,18 +37,23 @@ Current topics consumed by the Rust data platform:
 
 Future order/payment topics can use the same Bronze identity and partition layout.
 
-## Kafka To Bronze Data Lake Flow
+## Data Lake Parquet Pipeline (Bronze / Silver / Gold)
 
 ```mermaid
 flowchart LR
-    KafkaTopic[Kafka topic partition offset] --> RawEvent[RawKafkaEvent]
-    RawEvent --> Identity[topic + partition + offset]
-    Identity --> Path[data-lake/bronze/kafka/topic/date/hour/part-partition-offset.parquet]
-    Path --> Decode[Debezium decode]
-    Decode --> Silver[SilverInventoryEvent]
+    KafkaTopic[Debezium Kafka Topic] --> CDCConsumer[cdc-consumer]
+    CDCConsumer --> Bronze[(Bronze Parquet: Raw JSON)]
+    CDCConsumer --> Decode[Debezium Decoder]
+    Decode --> Silver[(Silver Parquet: Normalized Events)]
+    Silver --> BuildGold[build_gold Batch Job]
+    BuildGold --> Gold[(Gold Parquet: Daily Demand)]
 ```
 
-Kafka offsets are committed only after Bronze persistence and downstream processing succeed. Replays write the same deterministic path and are counted as duplicates instead of creating uncontrolled duplicate files.
+The Data Lake Parquet pipeline ensures data durability and enables historical batch analytics (independent of real-time ClickHouse processing). It operates in three tiers:
+
+1. **Bronze (Raw Data Backup)**: The `cdc-consumer` service reads Kafka messages and uses `polars` to write them precisely as-is into `data-lake/bronze/kafka/<topic>/date/hour/part-partition-offset.parquet`. Kafka offsets are committed only after this atomic write succeeds. Replays write the same deterministic path and are counted as duplicates.
+2. **Silver (Cleaned/Normalized)**: Also generated in real-time by the `cdc-consumer`. The raw Debezium JSON is parsed, validated, and flattened into a strict schema (`SilverInventoryEvent`). This is saved to `data-lake/silver/inventory_events`.
+3. **Gold (Analytical Aggregates)**: A standalone Rust batch job (`cargo run --bin build_gold`) scans the Silver Parquet folder. It filters for "Sale" movements, groups them by SKU, Location, and Date, and computes daily demand metrics, saving the results to `data-lake/gold/daily_demand/part-0000.parquet`.
 
 ## Real-Time Feature Flow
 
