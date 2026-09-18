@@ -103,7 +103,8 @@ public class BasketState(
             CardSecurityNumber: "111",
             CardTypeId: checkoutInfo.CardTypeId,
             Buyer: buyerId,
-            Items: [.. orderItems]);
+            Items: [.. orderItems],
+            LocationCode: checkoutInfo.LocationCode);
         await orderingService.CreateOrder(request, checkoutInfo.RequestId);
         await DeleteBasketAsync();
     }
@@ -169,4 +170,5 @@ public record CreateOrderRequest(
     string CardSecurityNumber,
     int CardTypeId,
     string Buyer,
-    List<BasketItem> Items);
+    List<BasketItem> Items,
+    string LocationCode = "NCR");

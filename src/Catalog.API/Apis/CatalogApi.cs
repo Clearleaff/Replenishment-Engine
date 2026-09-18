@@ -419,10 +419,7 @@ public static class CatalogApi
             CatalogTypeId = product.CatalogTypeId,
             Description = product.Description,
             PictureFileName = product.PictureFileName,
-            Price = product.Price,
-            AvailableStock = product.AvailableStock,
-            RestockThreshold = product.RestockThreshold,
-            MaxStockThreshold = product.MaxStockThreshold
+            Price = product.Price
         };
         item.Embedding = await services.CatalogAI.GetEmbeddingAsync(item);
 

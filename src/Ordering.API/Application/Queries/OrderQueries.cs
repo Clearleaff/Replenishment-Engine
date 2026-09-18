@@ -23,6 +23,7 @@ public class OrderQueries(OrderingContext context)
             Street = order.Address.Street,
             Zipcode = order.Address.ZipCode,
             Status = order.OrderStatus.ToString(),
+            LocationCode = order.LocationCode,
             Total = order.GetTotal(),
             OrderItems = order.OrderItems.Select(oi => new Orderitem
             {
@@ -43,6 +44,7 @@ public class OrderQueries(OrderingContext context)
                 OrderNumber = o.Id,
                 Date = o.OrderDate,
                 Status = o.OrderStatus.ToString(),
+                LocationCode = o.LocationCode,
                 Total =(double) o.OrderItems.Sum(oi => oi.UnitPrice* oi.Units)
             })
             .ToListAsync();

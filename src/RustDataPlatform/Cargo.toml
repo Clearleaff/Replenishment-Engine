@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+  "common",
+  "feature-engine",
+  "governance",
+  "lakehouse",
+  "replenishment-agent",
+  "warehouse",
+  "cdc-consumer",
+  "hybrid-orchestrator",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8.9"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+polars = { version = "0.55.2", features = ["parquet"] }
+rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl-vendored"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
+thiserror = "2.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.0", features = ["serde", "v4", "v5"] }

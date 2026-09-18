@@ -91,6 +91,48 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
+### Adaptive Inventory Replenishment Demo
+
+The optional local data platform demonstrates:
+
+```text
+Order generator -> Ordering -> Inventory.API -> PostgreSQL WAL -> Debezium
+  -> Kafka -> Bronze/Silver/Gold Parquet -> Rust feature engine
+  -> agent proposal/governance/policy/executor -> Inventory.API
+```
+
+Start the local CDC stack:
+
+```console
+Parameters__clickhouse-password=local-dev-only \
+Parameters__order-generator-client-secret=local-dev-generator-only \
+DataPlatform__Enabled=true \
+DataPlatform__AgentMode=AUTO_DEMO \
+DataPlatform__SimulatedLeadTimeSeconds=15 \
+OrderGenerator__Enabled=true \
+OrderGenerator__Profile=REGIONAL_SPIKE \
+OrderGenerator__TargetSkuId=42 \
+OrderGenerator__RatePerSecond=10 \
+OrderGenerator__DurationSeconds=60 \
+ESHOP_USE_HTTP_ENDPOINTS=1 \
+aspire start --apphost src/eShop.AppHost/eShop.AppHost.csproj
+```
+
+Watch the Rust dashboard:
+
+```console
+curl http://127.0.0.1:8088/health
+curl http://127.0.0.1:8088/api/sku-locations/42/NCR
+```
+
+Build the offline Gold daily-demand dataset from Silver Parquet:
+
+```console
+DATA_LAKE_ROOT=data-lake cargo run --manifest-path src/RustDataPlatform/Cargo.toml -p lakehouse --bin build_gold
+```
+
+See [docs/architecture.md](docs/architecture.md), [docs/rust-data-pipeline-walkthrough.md](docs/rust-data-pipeline-walkthrough.md), and [docs/replenishment-agent-walkthrough.md](docs/replenishment-agent-walkthrough.md) for the full architecture and implementation notes.
+
 ### Optional: AI Chatbot with Microsoft Foundry
 
 This option provisions a Microsoft Foundry resource during local development, so first authenticate to Azure and configure the subscription and location:

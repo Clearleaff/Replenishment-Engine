@@ -16,6 +16,8 @@ test('place an order through checkout', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Checkout' })).toBeVisible();
   await expect(page.getByLabel('Address')).toHaveValue('15703 NE 61st Ct');
   await expect(page.getByLabel('City')).toHaveValue('Redmond');
+  await page.getByLabel('Distribution center').selectOption('BLR');
+  await expect(page.getByLabel('Distribution center')).toHaveValue('BLR');
   await page.getByRole('button', { name: 'Place order' }).click();
 
   await expect(page).toHaveURL(/\/user\/orders$/);

@@ -52,9 +52,6 @@ public partial class CatalogContextSeed(
                 Price = source.Price,
                 CatalogBrandId = brandIdsByName[source.Brand!],
                 CatalogTypeId = typeIdsByName[source.Type!],
-                AvailableStock = 100,
-                MaxStockThreshold = 200,
-                RestockThreshold = 10,
                 PictureFileName = $"{source.Id}.webp",
             }).ToArray();
 

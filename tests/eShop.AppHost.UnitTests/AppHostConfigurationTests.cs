@@ -23,6 +23,36 @@ public class AppHostConfigurationTests
     }
 
     [TestMethod]
+    [DataRow(null, false)]
+    [DataRow("", false)]
+    [DataRow("invalid", false)]
+    [DataRow("false", false)]
+    [DataRow("true", true)]
+    public void OrderGeneratorFlagUsesSafeOptInDefault(string? configuredValue, bool expected)
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["OrderGenerator:Enabled"] = configuredValue })
+            .Build();
+
+        Assert.AreEqual(expected, Extensions.IsOrderGeneratorEnabled(configuration));
+    }
+
+    [TestMethod]
+    [DataRow(null, false)]
+    [DataRow("", false)]
+    [DataRow("invalid", false)]
+    [DataRow("false", false)]
+    [DataRow("true", true)]
+    public void DataPlatformFlagUsesSafeOptInDefault(string? configuredValue, bool expected)
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["DataPlatform:Enabled"] = configuredValue })
+            .Build();
+
+        Assert.AreEqual(expected, Extensions.IsDataPlatformEnabled(configuration));
+    }
+
+    [TestMethod]
     public void FoundryExtensionAddsExpectedDeployments()
     {
         var builder = CreateBuilder();

@@ -65,6 +65,8 @@ project.lock.json
 project.fragment.lock.json
 artifacts/
 src/eShop.AppHost/aspire-output/
+src/RustDataPlatform/target/
+data-lake/
 
 # Tye
 .tye/
@@ -340,6 +342,8 @@ __pycache__/
 
 # Tabs Studio
 *.tss
+
+.venv-parquet/
 
 # Telerik's JustMock configuration file
 *.jmconfig

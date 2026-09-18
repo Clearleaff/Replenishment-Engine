@@ -5,7 +5,6 @@ global using eShop.Catalog.API.Infrastructure;
 global using eShop.Catalog.API.Infrastructure.EntityConfigurations;
 global using eShop.Catalog.API.Infrastructure.Exceptions;
 global using eShop.Catalog.API.IntegrationEvents;
-global using eShop.Catalog.API.IntegrationEvents.EventHandling;
 global using eShop.Catalog.API.IntegrationEvents.Events;
 global using eShop.Catalog.API.Model;
 global using eShop.EventBus.Abstractions;

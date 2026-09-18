@@ -49,6 +49,18 @@
                         <ValidationMessage For="@(() => Info.Country)" />
                     </label>
                 </div>
+                <div>
+                    <label>
+                        Distribution center
+                        <InputSelect @bind-Value="@Info.LocationCode">
+                            <option value="NCR">NCR — National Capital Region</option>
+                            <option value="BLR">BLR — Bengaluru</option>
+                            <option value="BOM">BOM — Mumbai</option>
+                            <option value="HYD">HYD — Hyderabad</option>
+                        </InputSelect>
+                        <ValidationMessage For="@(() => Info.LocationCode)" />
+                    </label>
+                </div>
             </div>
             <div class="form-section">
                 <div class="form-buttons">

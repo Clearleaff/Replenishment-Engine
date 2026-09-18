@@ -1,15 +1,10 @@
 ﻿namespace eShop.Ordering.API.Application.Commands;
 
 // Regular CommandHandler
-public class SetPaidOrderStatusCommandHandler : IRequestHandler<SetPaidOrderStatusCommand, bool>
+public class SetPaidOrderStatusCommandHandler(
+    IOrderRepository orderRepository,
+    IOptions<OrderingProcessingOptions> options) : IRequestHandler<SetPaidOrderStatusCommand, bool>
 {
-    private readonly IOrderRepository _orderRepository;
-
-    public SetPaidOrderStatusCommandHandler(IOrderRepository orderRepository)
-    {
-        _orderRepository = orderRepository;
-    }
-
     /// <summary>
     /// Handler which processes the command when
     /// Shipment service confirms the payment
@@ -19,17 +14,22 @@ public class SetPaidOrderStatusCommandHandler : IRequestHandler<SetPaidOrderStat
     public async Task<bool> Handle(SetPaidOrderStatusCommand command, CancellationToken cancellationToken)
     {
         // Simulate a work time for validating the payment
-        await Task.Delay(10000, cancellationToken);
+        await DelayIfConfiguredAsync(cancellationToken);
 
-        var orderToUpdate = await _orderRepository.GetAsync(command.OrderNumber);
+        var orderToUpdate = await orderRepository.GetAsync(command.OrderNumber);
         if (orderToUpdate == null)
         {
             return false;
         }
 
         orderToUpdate.SetPaidStatus();
-        return await _orderRepository.UnitOfWork.SaveEntitiesAsync(cancellationToken);
+        return await orderRepository.UnitOfWork.SaveEntitiesAsync(cancellationToken);
     }
+
+    private Task DelayIfConfiguredAsync(CancellationToken cancellationToken) =>
+        options.Value.SimulatedDelayMilliseconds == 0
+            ? Task.CompletedTask
+            : Task.Delay(options.Value.SimulatedDelayMilliseconds, cancellationToken);
 }
 
 

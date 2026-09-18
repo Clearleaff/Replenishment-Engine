@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <UserSecretsId>b99dbce4-17d4-41d2-858a-2b0529d60bb8</UserSecretsId>
+    <NoWarn>$(NoWarn);ASPIRE010</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +15,7 @@
     <PackageReference Include="Aspire.Hosting.Redis" />
     <PackageReference Include="Aspire.Hosting.PostgreSQL" />
     <PackageReference Include="Aspire.Hosting.Foundry" />
+    <PackageReference Include="Aspire.Hosting.Kafka" />
     <PackageReference Include="Aspire.Hosting.Yarp" />
     <PackageReference Include="CommunityToolkit.Aspire.Hosting.Ollama" />
   </ItemGroup>
@@ -22,12 +24,14 @@
     <ProjectReference Include="..\Basket.API\Basket.API.csproj" />
     <ProjectReference Include="..\Catalog.API\Catalog.API.csproj" />
     <ProjectReference Include="..\Identity.API\Identity.API.csproj" />
+    <ProjectReference Include="..\Inventory.API\Inventory.API.csproj" />
     <ProjectReference Include="..\Ordering.API\Ordering.API.csproj" />
     <ProjectReference Include="..\OrderProcessor\OrderProcessor.csproj" />
     <ProjectReference Include="..\PaymentProcessor\PaymentProcessor.csproj" />
     <ProjectReference Include="..\Webhooks.API\Webhooks.API.csproj" />
     <ProjectReference Include="..\WebApp\WebApp.csproj" />
     <ProjectReference Include="..\WebhookClient\WebhookClient.csproj" />
+    <ProjectReference Include="..\..\tools\OrderLoadGenerator\OrderLoadGenerator.csproj" />
   </ItemGroup>
 
   <ItemGroup>

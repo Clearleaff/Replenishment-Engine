@@ -1,0 +1,32 @@
+[package]
+name = "hybrid-orchestrator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# ── Workspace-inherited dependencies ──────────────────────────────────────────
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+reqwest.workspace = true
+tokio-retry = "0.3"
+
+# ── Existing platform crates (production-grade, no reinvention) ────────────────
+data-platform-common = { path = "../common" }
+replenishment-agent  = { path = "../replenishment-agent" }
+feature-engine       = { path = "../feature-engine" }
+lakehouse            = { path = "../lakehouse" }
+
+# ── AMQP consumer (RabbitMQ bridge to .NET eShop EventBus) ────────────────────
+lapin = "2.3.1"

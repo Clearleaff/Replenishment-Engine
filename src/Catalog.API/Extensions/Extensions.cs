@@ -28,9 +28,9 @@ public static class Extensions
 
         builder.Services.AddTransient<ICatalogIntegrationEventService, CatalogIntegrationEventService>();
 
-        builder.AddRabbitMqEventBus("eventbus")
-               .AddSubscription<OrderStatusChangedToAwaitingValidationIntegrationEvent, OrderStatusChangedToAwaitingValidationIntegrationEventHandler>()
-               .AddSubscription<OrderStatusChangedToPaidIntegrationEvent, OrderStatusChangedToPaidIntegrationEventHandler>();
+        // Inventory.API is now the single stock authority. Catalog retains the
+        // event bus only for catalog-owned events such as product price changes.
+        builder.AddRabbitMqEventBus("eventbus");
 
         builder.Services.AddOptions<CatalogOptions>()
             .BindConfiguration(nameof(CatalogOptions));

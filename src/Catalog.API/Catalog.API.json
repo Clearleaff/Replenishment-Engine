@@ -1110,33 +1110,6 @@
                 "$ref": "#/components/schemas/CatalogBrand"
               }
             ]
-          },
-          "availableStock": {
-            "pattern": "^-?(?:0|[1-9]\\d*)$",
-            "type": [
-              "integer",
-              "string"
-            ],
-            "format": "int32"
-          },
-          "restockThreshold": {
-            "pattern": "^-?(?:0|[1-9]\\d*)$",
-            "type": [
-              "integer",
-              "string"
-            ],
-            "format": "int32"
-          },
-          "maxStockThreshold": {
-            "pattern": "^-?(?:0|[1-9]\\d*)$",
-            "type": [
-              "integer",
-              "string"
-            ],
-            "format": "int32"
-          },
-          "onReorder": {
-            "type": "boolean"
           }
         }
       },

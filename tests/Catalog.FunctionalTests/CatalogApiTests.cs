@@ -58,8 +58,8 @@ public sealed class CatalogApiTests : IClassFixture<CatalogApiFixture>
         var itemToUpdate = JsonSerializer.Deserialize<CatalogItem>(body, _jsonSerializerOptions);
 
         // Act - 2
-        var priorAvailableStock = itemToUpdate.AvailableStock;
-        itemToUpdate.AvailableStock -= 1;
+        var priorDescription = itemToUpdate.Description;
+        itemToUpdate.Description = $"{priorDescription} updated";
         response = version switch
         {
             1.0 => await _httpClient.PutAsJsonAsync("/api/catalog/items", itemToUpdate, TestContext.Current.CancellationToken),
@@ -76,7 +76,7 @@ public sealed class CatalogApiTests : IClassFixture<CatalogApiFixture>
 
         // Assert - 1
         Assert.Equal(itemToUpdate.Id, updatedItem.Id);
-        Assert.NotEqual(priorAvailableStock, updatedItem.AvailableStock);
+        Assert.NotEqual(priorDescription, updatedItem.Description);
     }
 
     [Theory]
@@ -93,8 +93,8 @@ public sealed class CatalogApiTests : IClassFixture<CatalogApiFixture>
         var itemToUpdate = JsonSerializer.Deserialize<CatalogItem>(body, _jsonSerializerOptions);
 
         // Act - 2
-        var priorAvailableStock = itemToUpdate.AvailableStock;
-        itemToUpdate.AvailableStock -= 1;
+        var priorDescription = itemToUpdate.Description;
+        itemToUpdate.Description = $"{priorDescription} updated";
         itemToUpdate.Price = 1.99m;
         response = version switch
         {
@@ -113,7 +113,7 @@ public sealed class CatalogApiTests : IClassFixture<CatalogApiFixture>
         // Assert - 1
         Assert.Equal(itemToUpdate.Id, updatedItem.Id);
         Assert.Equal(1.99m, updatedItem.Price);
-        Assert.NotEqual(priorAvailableStock, updatedItem.AvailableStock);
+        Assert.NotEqual(priorDescription, updatedItem.Description);
     }
 
     [Theory]
@@ -375,11 +375,7 @@ public sealed class CatalogApiTests : IClassFixture<CatalogApiFixture>
             CatalogTypeId = 8,
             CatalogType = null,
             CatalogBrandId = 13,
-            CatalogBrand = null,
-            AvailableStock = 100,
-            RestockThreshold = 10,
-            MaxStockThreshold = 200,
-            OnReorder = false
+            CatalogBrand = null
         };
         var response = await _httpClient.PostAsJsonAsync("/api/catalog/items", bodyContent, TestContext.Current.CancellationToken);
         response.EnsureSuccessStatusCode();
