@@ -2,6 +2,9 @@
 # Hybrid Orchestrator Architecture & System Specification
 
 This document explains the hybrid orchestrator from a system-design point of view. It focuses on boundaries, runtime flow, safety gates, failure behavior, and what must change before the service can execute real restocks.
+
+---
+
 ## 1. Executive Summary
 
 ## 1. System context
@@ -35,6 +38,10 @@ flowchart TD
         Ordering[Ordering.API] -->|Publishes OrderStockConfirmed| RabbitMQ[(RabbitMQ EventBus)]
         Payment[PaymentProcessor] --> RabbitMQ
         OrderProc[OrderProcessor] --> RabbitMQ
+    subgraph eShopStorefront [".NET Microservices Layer (RabbitMQ)"]
+        Ordering["Ordering.API"] -->|"Publishes OrderStockConfirmed"| RabbitMQ[("RabbitMQ EventBus")]
+        Payment["PaymentProcessor"] --> RabbitMQ
+        OrderProc["OrderProcessor"] --> RabbitMQ
     end
 
     Ordering -->|Order stock event + balance snapshot| Rabbit
@@ -53,6 +60,13 @@ flowchart TD
         Kafka --> cdc[cdc-consumer]
         cdc --> Lakehouse[(Bronze / Silver Parquet)]
         cdc --> ClickHouse[(ClickHouse Analytics)]
+    subgraph DataPlatform ["PostgreSQL CDC & Storage (Kafka)"]
+        InvAPI["Inventory.API"] -->|"Writes Transactions"| Postgres[("PostgreSQL inventorydb")]
+        Postgres -->|"Logical WAL Stream"| Debezium["Debezium Connect"]
+        Debezium -->|"Raw Row Changes"| Kafka[("Kafka Cluster")]
+        cdc["cdc-consumer"] -->|"Ingest Kafka Streams"| Kafka
+        cdc --> Lakehouse[("Bronze / Silver Parquet")]
+        cdc --> ClickHouse[("ClickHouse Analytics")]
     end
 
     classDef future stroke-dasharray: 5 5,color:#777;
@@ -64,17 +78,29 @@ flowchart TD
         Agent --> Sim[SimulationEngine]
         Sim --> LLM[Sandboxed LlmClient]
         LLM --> Gate[PolicyGate Governance]
+    subgraph HybridOrchestrator ["hybrid-orchestrator (AMQP / RabbitMQ)"]
+        RabbitMQ -->|"OrderStockConfirmed + Balance Snapshot"| Consumer["Resilient AMQP Consumer"]
+        Consumer --> State["AppState & Rolling Feature Cache"]
+        State --> Agent["replenishment-agent"]
+        Agent --> Sim["SimulationEngine"]
+        Sim --> LLM["Sandboxed LlmClient"]
+        LLM --> Gate["PolicyGate Governance"]
         Gate --> State
         State --> HttpAPI[Axum HTTP API]
+        State --> HttpAPI["Axum HTTP API"]
     end
 
     subgraph Operations ["Human-in-the-Loop (HITL)"]
         HttpAPI <-->|Review & Approve Proposals| Operator[Human Operator / Boss Desk]
         HttpAPI -. Emits LOG_ONLY Command Preview .-> Operator
+        HttpAPI <-->|"Review & Approve Proposals"| Operator["Human Operator / Boss Desk"]
+        HttpAPI -. "Emits LOG_ONLY Command Preview" .-> Operator
     end
 ```
 
 Key point: Inventory remains the only service allowed to own stock. The current orchestrator only prepares proposals and command previews.
+> **Key Invariant:** Inventory remains the only service allowed to own and mutate stock. The current orchestrator only prepares proposals and command previews.
+
 ---
 
 ## 2. Internal module architecture
@@ -101,6 +127,11 @@ flowchart LR
         O2 -->|Domain Event + Balance Snapshot| O3[(RabbitMQ)]
         O3 -->|Immediate Work Queue Dispatch| O4[hybrid-orchestrator]
         O4 --> O5[Operator Review & Approval]
+    subgraph OperationalPath ["Operational Tier: hybrid-orchestrator"]
+        O1["Online Customer Checkout"] --> O2["Ordering.API"]
+        O2 -->|"Domain Event + Balance Snapshot"| O3[("RabbitMQ")]
+        O3 -->|"Immediate Work Queue Dispatch"| O4["hybrid-orchestrator"]
+        O4 --> O5["Operator Review & Approval"]
     end
 
     Main -->|loads env| State
@@ -118,6 +149,12 @@ flowchart LR
         A3 -->|Append-Only Partitioned Log| A4[(Kafka)]
         A4 -->|Log Replay & Storage| A5[cdc-consumer]
         A5 --> A6[Parquet Data Lake & ClickHouse]
+    subgraph AnalyticalPath ["Data Platform Tier: cdc-consumer"]
+        A1["Any DB Mutation: Orders, Truck Restock, Adjustments"] --> A2[("PostgreSQL WAL")]
+        A2 -->|"Logical CDC"| A3["Debezium"]
+        A3 -->|"Append-Only Partitioned Log"| A4[("Kafka")]
+        A4 -->|"Log Replay & Storage"| A5["cdc-consumer"]
+        A5 --> A6["Parquet Data Lake & ClickHouse"]
     end
 ```
 
@@ -172,6 +209,33 @@ Why this matters: bad data is rejected, missing stock state is not invented, dup
 The service runtime coordinates four concurrent asynchronous fibers inside a multi-threaded Tokio runtime:
 
 ```mermaid
+flowchart TB
+    Main["src/main.rs: tokio::select!"]
+    Main --> HTTP["Fiber 1: Axum HTTP Server"]
+    Main --> AMQP["Fiber 2: Resilient AMQP Consumer"]
+    Main --> Cleanup["Fiber 3: Expired Proposal Purge"]
+    Main --> Signal["Fiber 4: OS SIGINT / SIGTERM Trap"]
+
+    subgraph StateManagement ["Thread-Safe State (AppState)"]
+        State["AppState"]
+        PropStore["Arc<Mutex<HashMap<Uuid, ProposalRecord>>>"]
+        SeenEvents["Arc<Mutex<HashSet<String>>>"]
+        Features["Arc<Mutex<HashMap<SkuLocation, SkuLocationState>>>"]
+        Metrics["Arc<Mutex<OrchestratorMetrics>>>"]
+    end
+
+    HTTP <--> State
+    AMQP <--> State
+    Cleanup <--> State
+    State --- PropStore
+    State --- SeenEvents
+    State --- Features
+    State --- Metrics
+```
+
+### Sequence Flow:
+
+```mermaid
 sequenceDiagram
     participant O as Ordering / Producer
     participant R as RabbitMQ
@@ -222,6 +286,7 @@ flowchart TB
 
 The LLM is not shown as an actor with system access because it does not get system access. It only receives deterministic decision/simulation context and returns explanation text.
 ### Concurrency Guarantees & Memory Partitioning
+### Concurrency Guarantees & Memory Partitioning:
 - **Granular Mutex Partitioning:** Instead of a single monolithic lock, `AppState` partitions shared memory into distinct `Arc<Mutex<T>>` buckets (`proposals`, `seen_events`, `feature_states`, `metrics`). An incoming HTTP telemetry request reading `metrics` will never block the background AMQP consumer updating `feature_states`.
 - **Bounded Memory:** Expired proposals are purged periodically (`cleanup_interval`, default 60s) based on proposal TTL (default 1 hour) to guarantee strictly bounded memory usage.
 
@@ -256,6 +321,19 @@ flowchart TD
     F -- Yes --> G[Apply Balance Snapshot & Movement Fact]
     G --> H[Recalculate Feature Engine Metrics]
     H --> I[Execute Replenishment Evaluation]
+    A["RabbitMQ Message Delivery"] --> B{"Valid JSON?"}
+    B -- No --> B1["NACK requeue=false -> DLQ"]
+    B -- Yes --> C{"Valid Positive Quantities?"}
+    C -- No --> C1["NACK requeue=false -> Poison Error"]
+    C -- Yes --> D{"Source Event Key Seen?"}
+    D -- Yes --> D1["ACK Message -> Duplicate Skipped"]
+    D -- No --> E{"Authoritative Balance Present?"}
+    E -- No --> E1["ACK Message -> Safe Skip: Refuse to Guess Stock"]
+    E -- Yes --> F{"Balance Invariants Hold?"}
+    F -- No --> F1["NACK requeue=false -> Invariant Failure"]
+    F -- Yes --> G["Apply Balance Snapshot & Movement Fact"]
+    G --> H["Recalculate Feature Engine Metrics"]
+    H --> I["Execute Replenishment Evaluation"]
 ```
 
 Current implementation reaches `Proposed`, `Approved`, or `Rejected`. `Executing`, `Succeeded`, and `Failed` are future real-executor states.
@@ -319,6 +397,12 @@ flowchart LR
     Decision --> Candidates[Candidate Generation]
     Candidates --> Sim[SimulationEngine Grid Search]
     Sim --> Outcome[Optimal Capacity-Safe Proposal]
+    Fact["InventoryMovementFact"] --> Rolling["5m, 15m, 1h Sliding Windows"]
+    Rolling --> EWMA["Adaptive EWMA Forecast"]
+    EWMA --> Decision["ReplenishmentAgent::evaluate"]
+    Decision --> Candidates["Candidate Generation"]
+    Candidates --> Sim["SimulationEngine Grid Search"]
+    Sim --> Outcome["Optimal Capacity-Safe Proposal"]
 ```
 
 | Boundary | Current behavior |
@@ -432,6 +516,16 @@ flowchart TD
     Schema -- Yes --> Firewall{Passes HybridPolicyLimits?}
     Firewall -- No --> Veto[Policy Boundary Veto & Trigger Fallback]
     Firewall -- Yes --> Pass[Accepted AI Proposal]
+    Context["Deterministic Decision & Simulation Context"] --> Prompt["Structured Prompt Formulation"]
+    Prompt --> HTTP["HTTPS Request with 3.5s Timeout"]
+    HTTP --> Breaker{"Circuit Breaker Open?"}
+    Breaker -- Yes --> Fallback["Deterministic Fallback Reasoning"]
+    Breaker -- No --> Provider["Groq / OpenAI Inference API"]
+    Provider --> Schema{"Valid propose_action JSON?"}
+    Schema -- No --> Fail["Record Failure & Trigger Fallback"]
+    Schema -- Yes --> Firewall{"Passes HybridPolicyLimits?"}
+    Firewall -- No --> Veto["Policy Boundary Veto & Trigger Fallback"]
+    Firewall -- Yes --> Pass["Accepted AI Proposal"]
 ```
 
 The LLM is deliberately boxed in:
@@ -497,6 +591,7 @@ Poison pills do not loop forever. Transient platform failures are requeued.
 
 `AppState` now contains:
 ## 9. Human-in-the-Loop (HITL) REST API Specification
+## 9. Failure and Recovery Model
 
 - typed config loaded from environment
 - `LlmClient` with provider/circuit state
@@ -507,8 +602,38 @@ Poison pills do not loop forever. Transient platform failures are requeued.
 - health/readiness fields
 - operational metrics
 Default bind address: `127.0.0.1:5000`.
+```mermaid
+flowchart LR
+    Fail["Failure"] --> Parse["Malformed JSON"]
+    Fail --> Invariant["Invalid balance invariant"]
+    Fail --> Duplicate["Duplicate delivery"]
+    Fail --> Missing["Missing balance"]
+    Fail --> Restart["Service restart"]
 
 The in-memory proposal/idempotency stores are production-shaped but not production-durable yet. Before real execution mode is enabled, move them to governance PostgreSQL tables.
+    Parse --> ParseAction["NACK no requeue"]
+    Invariant --> InvAction["NACK no requeue"]
+    Duplicate --> DupAction["ACK skip"]
+    Missing --> MissingAction["ACK safe skip"]
+    Restart --> RestartAction["Pending in-memory proposals lost"]
+```
+
+| Boundary | Current behavior |
+|---|---|
+| **Inventory state** | Must arrive as balance snapshot; never guessed |
+| **LLM** | Explanation only; no tools, DB, HTTP, shell, or queue access |
+| **Policy** | Deterministic `PolicyGate` owns approval outcome |
+| **Execution** | `LOG_ONLY`; no Inventory mutation |
+| **Idempotency** | In-process event-key set; durable inbox still required |
+| **Approval storage** | In-memory proposal store; durable governance DB still required |
+| **Bad messages** | Malformed JSON and invariant failures are nacked with `requeue=false` |
+
+---
+
+## 10. Human-in-the-Loop (HITL) REST API Specification
+
+Default bind address: `127.0.0.1:5005` (configured via `HYBRID_ORCHESTRATOR_BIND`).
+
 ### 1. Health & Telemetry Check
 ```http
 GET /health
@@ -527,6 +652,7 @@ GET /health
     "circuitOpen": false,
     "consecutiveFailures": 0,
     "model": "llama-3.3-70b-versatile"
+    "model": "qwen/qwen3.8-27b"
   },
   "metrics": {
     "deliveriesSeen": 42,
@@ -575,6 +701,7 @@ POST /api/v1/proposals/{proposalId}/approve
 ---
 
 ## 10. Execution Safety: Why `LOG_ONLY` Mode?
+## 11. Execution Safety: Why `LOG_ONLY` Mode?
 
 Currently, the service runs strictly under `HYBRID_ORCHESTRATOR_EXECUTION_MODE=LOG_ONLY`.
 
@@ -589,6 +716,7 @@ In `LOG_ONLY` mode, approving a proposal logs the audit trail and outputs an exa
 ---
 
 ## 11. Verification & Testing Strategy
+## 12. Verification & Testing Strategy
 
 The crate enforces comprehensive multi-level automated verification:
 
@@ -603,6 +731,7 @@ The crate enforces comprehensive multi-level automated verification:
 ---
 
 ## 12. Production Roadmap & Hardening
+## 13. Production Roadmap & Hardening
 
 Before transitioning from `LOG_ONLY` to real automated execution against `Inventory.API`:
 
