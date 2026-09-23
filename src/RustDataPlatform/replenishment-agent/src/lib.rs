@@ -205,10 +205,22 @@ impl SimulationEngine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallRecord {
+    pub tool_name: String,
+    pub input: String,
+    pub output: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmReasoning {
     pub summary: String,
     pub key_points: Vec<String>,
     pub confidence: f64,
+    #[serde(default)]
+    pub tools_used: Vec<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -245,6 +257,8 @@ impl LlmReasoner for MockLlmReasoner {
             ),
             key_points: decision.reason_codes.clone(),
             confidence: 0.85,
+            tools_used: Vec::new(),
+            tool_calls: Vec::new(),
         })
     }
 }
@@ -859,6 +873,8 @@ mod tests {
             summary: "safe low-risk replenishment".to_owned(),
             key_points: vec!["LOW_RISK_AUTO_POLICY".to_owned()],
             confidence: 0.9,
+            tools_used: Vec::new(),
+            tool_calls: Vec::new(),
         };
         let mut proposal = ReorderProposal::from_decision(&decision, 10, reasoning);
         proposal.status = ProposalStatus::Approved;

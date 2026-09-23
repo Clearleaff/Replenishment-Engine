@@ -125,6 +125,7 @@ pub struct HealthResponse {
 pub struct AppState {
     pub config: Arc<OrchestratorConfig>,
     pub llm: LlmClient,
+    pub warehouse: Arc<warehouse::ClickHouseWarehouse>,
     proposals: Arc<Mutex<HashMap<Uuid, ProposalRecord>>>,
     seen_events: Arc<Mutex<HashSet<String>>>,
     feature_states: Arc<Mutex<HashMap<SkuLocation, SkuLocationState>>>,
@@ -135,9 +136,13 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: OrchestratorConfig) -> Self {
         let llm = LlmClient::new(config.llm.clone());
+        let warehouse = Arc::new(warehouse::ClickHouseWarehouse::new(
+            config.clickhouse.clone(),
+        ));
         Self {
             config: Arc::new(config),
             llm,
+            warehouse,
             proposals: Arc::new(Mutex::new(HashMap::new())),
             seen_events: Arc::new(Mutex::new(HashSet::new())),
             feature_states: Arc::new(Mutex::new(HashMap::new())),
@@ -181,6 +186,10 @@ impl AppState {
         state.apply_balance_snapshot(balance);
         state.apply_movement(&movement);
         state.calculate(as_of)
+    }
+
+    pub async fn get_feature_state(&self, key: &SkuLocation) -> Option<SkuLocationState> {
+        self.feature_states.lock().await.get(key).cloned()
     }
 
     pub async fn insert_proposal(&self, record: ProposalRecord) {

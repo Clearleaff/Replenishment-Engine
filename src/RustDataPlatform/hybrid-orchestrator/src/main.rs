@@ -1,6 +1,8 @@
 mod config;
 mod event_handler;
 mod llm_client;
+mod llm_tools;
+mod safety_firewall;
 mod state;
 
 use axum::{

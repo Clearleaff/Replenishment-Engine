@@ -14,12 +14,14 @@ use replenishment_agent::{
     ReplenishmentPolicyConfig, SimulationEngine,
 };
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tokio_retry::{Retry, strategy::ExponentialBackoff};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     llm_client::LlmFallbackReason,
+    llm_tools::ToolExecutionContext,
     state::{AppState, ProposalRecord, ProposalRecordInput},
 };
 
@@ -275,19 +277,25 @@ async fn handle_event(
     state.incr(|metrics| metrics.events_processed += 1).await;
 
     let agent = ReplenishmentAgent::new(ReplenishmentPolicyConfig::default(), AgentMode::Recommend);
-    let decision = agent.evaluate(&features, &balance, 0);
+    let base_decision = agent.evaluate(&features, &balance, 0);
 
-    if !features.forecast.spike_detected && decision.recommended_quantity <= 0 {
+    if !features.forecast.spike_detected && base_decision.recommended_quantity <= 0 {
         return Ok(HandleOutcome::NoAction);
     }
 
-    let candidates = candidate_quantities(&decision, &balance);
-    let simulation =
-        SimulationEngine::compare_reorder_quantities(&decision, &balance, 0, &candidates);
-    let llm_decision = state
-        .llm
-        .propose_or_fallback(&decision, &simulation, &balance)
-        .await;
+    let feature_state_val = state.get_feature_state(&balance.sku_location()).await;
+    let feature_state_mutex = feature_state_val.map(Mutex::new);
+
+    let ctx = ToolExecutionContext {
+        warehouse: &state.warehouse,
+        current_balance: &balance,
+        current_features: Some(&features),
+        feature_state: feature_state_mutex.as_ref(),
+        base_decision: &base_decision,
+        timeout: state.config.llm.tool_call_timeout,
+    };
+
+    let llm_decision = state.llm.propose_with_tools(&ctx, &balance).await;
     if let Some(reason) = llm_decision.fallback_reason {
         state
             .incr(|metrics| {
@@ -298,6 +306,14 @@ async fn handle_event(
             })
             .await;
     }
+
+    let mut decision = base_decision;
+    decision.recommended_quantity = llm_decision.proposed_quantity;
+    decision.risk_level = llm_decision.risk_level;
+
+    let candidates = candidate_quantities(&decision, &balance);
+    let simulation =
+        SimulationEngine::compare_reorder_quantities(&decision, &balance, 0, &candidates);
 
     let mut proposal = ReorderProposal::from_decision(
         &decision,

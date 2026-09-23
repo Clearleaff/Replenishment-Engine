@@ -1629,6 +1629,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "warehouse",
 ]
 
 [[package]]

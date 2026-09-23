@@ -21,7 +21,7 @@ import time
 import random
 
 scenario = sys.argv[1].lower() if len(sys.argv) > 1 else 'critical'
-target_sku = 2
+target_sku = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 target_loc = sys.argv[3].upper() if len(sys.argv) > 3 else 'BLR'
 order_id = int(sys.argv[4]) if len(sys.argv) > 4 else random.randint(10100, 99999)
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use data_platform_common::{InventoryBalanceState, InventoryMovementFact, SkuLocation};
 use feature_engine::{OnlineDemandModel, SkuLocationFeatures};
 use replenishment_agent::{
@@ -26,6 +26,24 @@ pub trait AnalyticalWarehouse: Send + Sync {
     async fn insert_dead_letter(&self, record: &DeadLetterRecord) -> Result<()>;
     async fn upsert_replenishment(&self, replenishment: &OpenReplenishment) -> Result<()>;
     async fn load_recovery_state(&self) -> Result<RecoveryState>;
+    async fn query_event_calendar(
+        &self,
+        location_code: &str,
+        days_ahead: u32,
+    ) -> Result<Vec<EventCalendarEntry>>;
+    async fn query_supplier_signals(
+        &self,
+        sku_id: Option<i32>,
+        location_code: &str,
+    ) -> Result<Vec<SupplierSignalEntry>>;
+    async fn query_historical_daily_sales(
+        &self,
+        sku_id: i32,
+        location_code: &str,
+        days_back: u32,
+    ) -> Result<Vec<DailySalesEntry>>;
+    async fn insert_event_calendar_entry(&self, entry: &EventCalendarEntry) -> Result<()>;
+    async fn insert_supplier_signal(&self, signal: &SupplierSignalEntry) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +232,76 @@ impl AnalyticalWarehouse for ClickHouseWarehouse {
             open_replenishments,
         })
     }
+
+    async fn query_event_calendar(
+        &self,
+        location_code: &str,
+        days_ahead: u32,
+    ) -> Result<Vec<EventCalendarEntry>> {
+        let loc = location_code.trim().to_ascii_uppercase();
+        let sql = format!(
+            "SELECT event_id,location_code,event_name,event_type,start_date,end_date,expected_demand_impact,notes,created_at,updated_at \
+             FROM {}.event_calendar FINAL \
+             WHERE (location_code = '{loc}' OR location_code = 'ALL') \
+               AND start_date <= today() + {days_ahead} \
+               AND end_date >= today() \
+             ORDER BY start_date ASC FORMAT JSONEachRow",
+            self.config.database
+        );
+        parse_json_lines::<EventCalendarEntry>(&self.execute(&sql).await?)
+    }
+
+    async fn query_supplier_signals(
+        &self,
+        sku_id: Option<i32>,
+        location_code: &str,
+    ) -> Result<Vec<SupplierSignalEntry>> {
+        let loc = location_code.trim().to_ascii_uppercase();
+        let sku_filter = match sku_id {
+            Some(id) => format!("AND (sku_id = {id} OR sku_id IS NULL)"),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT signal_id,sku_id,location_code,signal_type,severity,description,reported_at,resolved_at,source,created_at \
+             FROM {}.supplier_disruption_signals FINAL \
+             WHERE (location_code = '{loc}' OR location_code = 'ALL') \
+               {sku_filter} \
+               AND (resolved_at IS NULL OR resolved_at >= now() - INTERVAL 7 DAY) \
+             ORDER BY reported_at DESC FORMAT JSONEachRow",
+            self.config.database
+        );
+        parse_json_lines::<SupplierSignalEntry>(&self.execute(&sql).await?)
+    }
+
+    async fn query_historical_daily_sales(
+        &self,
+        sku_id: i32,
+        location_code: &str,
+        days_back: u32,
+    ) -> Result<Vec<DailySalesEntry>> {
+        let loc = location_code.trim().to_ascii_uppercase();
+        let sql = format!(
+            "SELECT toDate(occurred_at) AS date, toInt64(sum(quantity)) AS total_units \
+             FROM {}.fact_inventory_movements \
+             WHERE sku_id = {sku_id} \
+               AND location_code = '{loc}' \
+               AND movement_type = 'Sale' \
+               AND occurred_at >= now() - INTERVAL {days_back} DAY \
+             GROUP BY date \
+             ORDER BY date ASC FORMAT JSONEachRow",
+            self.config.database
+        );
+        parse_json_lines::<DailySalesEntry>(&self.execute(&sql).await?)
+    }
+
+    async fn insert_event_calendar_entry(&self, entry: &EventCalendarEntry) -> Result<()> {
+        self.insert_json("event_calendar", entry).await
+    }
+
+    async fn insert_supplier_signal(&self, signal: &SupplierSignalEntry) -> Result<()> {
+        self.insert_json("supplier_disruption_signals", signal)
+            .await
+    }
 }
 
 fn parse_json_lines<T: for<'de> Deserialize<'de>>(body: &str) -> Result<Vec<T>> {
@@ -258,7 +346,51 @@ pub fn schema_statements(database: &str) -> Vec<String> {
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.cdc_dead_letters (topic String, partition Int32, offset Int64, error String, payload String, recorded_at DateTime64(6, 'UTC')) ENGINE = MergeTree PARTITION BY toYYYYMM(recorded_at) ORDER BY (topic, partition, offset)"
         ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {database}.event_calendar (event_id UUID, location_code LowCardinality(String), event_name String, event_type LowCardinality(String), start_date Date, end_date Date, expected_demand_impact LowCardinality(String), notes Nullable(String), created_at DateTime64(6, 'UTC'), updated_at DateTime64(6, 'UTC')) ENGINE = ReplacingMergeTree(updated_at) ORDER BY (location_code, start_date, event_id)"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {database}.supplier_disruption_signals (signal_id UUID, sku_id Nullable(Int32), location_code LowCardinality(String), signal_type LowCardinality(String), severity LowCardinality(String), description String, reported_at DateTime64(6, 'UTC'), resolved_at Nullable(DateTime64(6, 'UTC')), source LowCardinality(String), created_at DateTime64(6, 'UTC')) ENGINE = ReplacingMergeTree(created_at) ORDER BY (location_code, reported_at, signal_id)"
+        ),
     ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventCalendarEntry {
+    pub event_id: Uuid,
+    pub location_code: String,
+    pub event_name: String,
+    pub event_type: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub expected_demand_impact: String,
+    pub notes: Option<String>,
+    #[serde(default = "chrono::Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "chrono::Utc::now")]
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SupplierSignalEntry {
+    pub signal_id: Uuid,
+    pub sku_id: Option<i32>,
+    pub location_code: String,
+    pub signal_type: String,
+    pub severity: String,
+    pub description: String,
+    pub reported_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub source: String,
+    #[serde(default = "chrono::Utc::now")]
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DailySalesEntry {
+    #[serde(alias = "sale_date")]
+    pub date: String,
+    pub total_units: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +720,8 @@ mod tests {
             "policy_decisions",
             "execution_attempts",
             "open_replenishments",
+            "event_calendar",
+            "supplier_disruption_signals",
         ] {
             assert!(schema.contains(table));
         }
