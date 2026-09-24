@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use data_platform_common::{InventoryBalanceState, InventoryMovementFact, SkuLocation};
 use feature_engine::{SkuLocationFeatures, SkuLocationState};
 use replenishment_agent::{
@@ -6,10 +7,7 @@ use replenishment_agent::{
     ReorderProposal, ReorderSimulation,
 };
 use serde::Serialize;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -97,6 +95,7 @@ pub struct OrchestratorMetrics {
     pub invalid_events: u64,
     pub duplicate_events: u64,
     pub feature_skips: u64,
+    pub llm_filter_skips: u64,
     pub proposals_created: u64,
     pub auto_approved: u64,
     pub human_approval_required: u64,
@@ -108,6 +107,7 @@ pub struct OrchestratorMetrics {
     pub processing_errors: u64,
     pub amqp_reconnects: u64,
     pub expired_proposals: u64,
+    pub llm_queue_overflow_drops: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +118,7 @@ pub struct HealthResponse {
     pub execution_mode: crate::config::ExecutionMode,
     pub amqp_connected: bool,
     pub llm: LlmClientStatus,
+    pub rate_limiter: crate::rate_limiter::RateLimiterStatus,
     pub metrics: OrchestratorMetrics,
 }
 
@@ -126,9 +127,12 @@ pub struct AppState {
     pub config: Arc<OrchestratorConfig>,
     pub llm: LlmClient,
     pub warehouse: Arc<warehouse::ClickHouseWarehouse>,
+    pub macro_cache: Arc<crate::macro_cache::MacroSignalCache>,
+    pub rate_limiter: Arc<crate::rate_limiter::TokenBucketRateLimiter>,
+    pub llm_semaphore: Arc<tokio::sync::Semaphore>,
     proposals: Arc<Mutex<HashMap<Uuid, ProposalRecord>>>,
-    seen_events: Arc<Mutex<HashSet<String>>>,
-    feature_states: Arc<Mutex<HashMap<SkuLocation, SkuLocationState>>>,
+    seen_events: Arc<DashMap<String, ()>>,
+    feature_states: Arc<DashMap<SkuLocation, SkuLocationState>>,
     metrics: Arc<Mutex<OrchestratorMetrics>>,
     amqp_connected: Arc<Mutex<bool>>,
 }
@@ -139,13 +143,28 @@ impl AppState {
         let warehouse = Arc::new(warehouse::ClickHouseWarehouse::new(
             config.clickhouse.clone(),
         ));
+        let macro_cache = Arc::new(crate::macro_cache::MacroSignalCache::new(
+            config.macro_cache_ttl,
+        ));
+        let rate_limiter = Arc::new(crate::rate_limiter::TokenBucketRateLimiter::new(
+            crate::rate_limiter::RateLimiterConfig {
+                tpm_budget: config.llm.groq_tpm_budget,
+                estimate_per_call: config.llm.estimate_per_call,
+                max_queue_depth: config.llm.queue_max_depth,
+                window: std::time::Duration::from_secs(60),
+            },
+        ));
+        let llm_semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_llm));
         Self {
             config: Arc::new(config),
             llm,
             warehouse,
+            macro_cache,
+            rate_limiter,
+            llm_semaphore,
             proposals: Arc::new(Mutex::new(HashMap::new())),
-            seen_events: Arc::new(Mutex::new(HashSet::new())),
-            feature_states: Arc::new(Mutex::new(HashMap::new())),
+            seen_events: Arc::new(DashMap::with_capacity(1_000_000)),
+            feature_states: Arc::new(DashMap::with_capacity(1_000_000)),
             metrics: Arc::new(Mutex::new(OrchestratorMetrics::default())),
             amqp_connected: Arc::new(Mutex::new(false)),
         }
@@ -154,6 +173,7 @@ impl AppState {
     pub async fn health(&self) -> HealthResponse {
         let amqp_connected = *self.amqp_connected.lock().await;
         let llm = self.llm.status().await;
+        let rate_limiter = self.rate_limiter.status().await;
         let ready = amqp_connected;
         HealthResponse {
             status: if ready { "Healthy" } else { "Degraded" }.to_owned(),
@@ -162,6 +182,7 @@ impl AppState {
             execution_mode: self.config.execution_mode,
             amqp_connected,
             llm,
+            rate_limiter,
             metrics: self.metrics().await,
         }
     }
@@ -171,7 +192,7 @@ impl AppState {
     }
 
     pub async fn remember_event(&self, key: &str) -> bool {
-        self.seen_events.lock().await.insert(key.to_owned())
+        self.seen_events.insert(key.to_owned(), ()).is_none()
     }
 
     pub async fn update_features(
@@ -181,15 +202,18 @@ impl AppState {
         as_of: DateTime<Utc>,
     ) -> Option<SkuLocationFeatures> {
         let key = balance.sku_location();
-        let mut states = self.feature_states.lock().await;
-        let state = states.entry(key).or_default();
+        let mut state = self.feature_states.entry(key).or_default();
         state.apply_balance_snapshot(balance);
         state.apply_movement(&movement);
         state.calculate(as_of)
     }
 
     pub async fn get_feature_state(&self, key: &SkuLocation) -> Option<SkuLocationState> {
-        self.feature_states.lock().await.get(key).cloned()
+        self.feature_states.get(key).map(|r| r.value().clone())
+    }
+
+    pub async fn seed_feature_state(&self, key: SkuLocation, state: SkuLocationState) {
+        self.feature_states.insert(key, state);
     }
 
     pub async fn insert_proposal(&self, record: ProposalRecord) {
@@ -288,4 +312,73 @@ pub enum ApproveError {
     NotFound,
     NotPending(ProposalStatus),
     Expired,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remember_event_concurrent_dedup() {
+        let state = AppState::new(OrchestratorConfig::from_env());
+        let event_key = "test-concurrent-event-key";
+        let mut handles = Vec::new();
+        for _ in 0..100 {
+            let state_clone = state.clone();
+            handles.push(tokio::spawn(async move {
+                state_clone.remember_event(event_key).await
+            }));
+        }
+
+        let mut true_count = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                true_count += 1;
+            }
+        }
+        assert_eq!(true_count, 1, "Exactly one task should see new event");
+    }
+
+    #[tokio::test]
+    async fn feature_states_concurrent_updates_distinct_skus() {
+        let state = AppState::new(OrchestratorConfig::from_env());
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let state_clone = state.clone();
+            handles.push(tokio::spawn(async move {
+                let balance = InventoryBalanceState {
+                    sku_id: i,
+                    location_code: "NCR".to_owned(),
+                    on_hand: 100,
+                    reserved: 0,
+                    available: 100,
+                    safety_stock: 10,
+                    reorder_point: 20,
+                    max_stock: 200,
+                    version: 1,
+                    updated_at: Utc::now(),
+                };
+                let movement = InventoryMovementFact {
+                    movement_id: Uuid::new_v4(),
+                    source_event_id: Uuid::new_v4(),
+                    sku_id: i,
+                    location_code: "NCR".to_owned(),
+                    order_id: Some(1),
+                    movement_type: data_platform_common::InventoryMovementType::Sale,
+                    quantity: 2,
+                    occurred_at: Utc::now(),
+                    recorded_at: Utc::now(),
+                    resulting_balance_version: 2,
+                    reason: None,
+                };
+                state_clone
+                    .update_features(balance, movement, Utc::now())
+                    .await
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.unwrap().is_some());
+        }
+    }
 }

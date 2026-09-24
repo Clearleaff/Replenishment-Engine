@@ -95,6 +95,7 @@ def generate_pdf(output_filename="SupplyChain_AI_Hybrid_Orchestrator_Master_Runb
         "Autonomous LLMs present severe non-deterministic risks if given raw API write access. "
         "The Hybrid Architecture enforces a deterministic <b>PolicyGate</b> and feature layer around a sandboxed "
         "LLM reasoning agent (Groq / Qwen-27B). The LLM is restricted to proposing quantities; execution is guarded "
+        "LLM reasoning agent (Groq / GPT-OSS-20B). The LLM is restricted to proposing quantities; execution is guarded "
         "by business invariant rules and human authorization webhooks.",
         body_style
     ))
@@ -164,6 +165,7 @@ $ cd ~/eShop/src/RustDataPlatform
 $ export AMQP_URL="amqp://guest:<PASSWORD>@127.0.0.1:<PORT>/%2f"
 $ export GROQ_API_KEY="gsk_..."
 $ export GROQ_MODEL="qwen/qwen3.8-27b"
+$ export GROQ_MODEL="openai/gpt-oss-20b"
 $ export LLM_TIMEOUT_MILLISECONDS=15000
 $ export RUST_LOG="hybrid_orchestrator=info,info"
 $ cargo run -p hybrid-orchestrator""", code_style))
@@ -178,9 +180,11 @@ $ cargo run -p hybrid-orchestrator""", code_style))
     ))
     story.append(Preformatted("""# Query proposals
 $ curl -sS http://127.0.0.1:5000/api/v1/proposals | jq '.[0]'
+$ curl -sS http://127.0.0.1:5005/api/v1/proposals | jq '.[0]'
 
 # Authorize replenishment via Boss's Desk webhook
 $ curl -X POST http://127.0.0.1:5000/api/v1/proposals/<PROPOSAL_ID>/approve | jq""", code_style))
+$ curl -X POST http://127.0.0.1:5005/api/v1/proposals/<PROPOSAL_ID>/approve | jq""", code_style))
     story.append(Spacer(1, 8))
 
     # Chapter 8
@@ -189,6 +193,7 @@ $ curl -X POST http://127.0.0.1:5000/api/v1/proposals/<PROPOSAL_ID>/approve | jq
         ["Symptom", "Root Cause", "Action"],
         ["IOError: invalid port", "Literal <PORT> in string", "Read exact port from aspire describe eventbus."],
         ["Groq HTTP 404", "Model ID deprecated", "Use active model: export GROQ_MODEL='qwen/qwen3.8-27b'."],
+        ["Groq HTTP 404", "Model ID deprecated", "Use active model: export GROQ_MODEL='openai/gpt-oss-20b'."],
         ["Proposal REJECTED", "Zero deficit", "Ensure balance payload has onHand < safetyStock."],
         ["Groq HTTP 429", "API rate limit reached", "Circuit breaker automatically trips to deterministic fallback."]
     ]

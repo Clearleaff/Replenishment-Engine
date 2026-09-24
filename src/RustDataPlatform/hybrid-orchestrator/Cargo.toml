@@ -31,3 +31,6 @@ warehouse            = { path = "../warehouse" }
 
 # ── AMQP consumer (RabbitMQ bridge to .NET eShop EventBus) ────────────────────
 lapin = "2.3.1"
+
+# ── Concurrent state structures for high-throughput scaling ───────────────────
+dashmap = "6"

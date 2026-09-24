@@ -343,6 +343,8 @@ impl LlmClient {
         let mut loop_guard = ToolLoopGuard::new(self.config.max_identical_tool_calls);
         let max_rounds = self.config.max_tool_rounds;
         let mut last_content: Option<String> = None;
+        let mut cumulative_tokens: u32 = 0;
+        let mut completed_rounds: usize = 0;
 
         for round in 0..max_rounds {
             let request_body = json!({
@@ -363,18 +365,32 @@ impl LlmClient {
                 .context("LLM request failed")?;
 
             let mut retries = 0;
-            while response.status() == StatusCode::TOO_MANY_REQUESTS && retries < 3 {
+            while (response.status() == StatusCode::TOO_MANY_REQUESTS
+                || response.status() == StatusCode::SERVICE_UNAVAILABLE)
+                && retries < 4
+            {
                 retries += 1;
-                let wait_secs = response
+                let status = response.status();
+                let retry_header = response
                     .headers()
                     .get("retry-after")
                     .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(3);
-                let sleep_secs = (wait_secs + 3).clamp(3, 30);
+                    .map(|s| s.to_owned());
+                let err_body = response.text().await.unwrap_or_default();
+                let sleep_secs = parse_retry_delay(retry_header.as_deref(), &err_body, retries);
+                let hint = err_body
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(150)
+                    .collect::<String>();
                 warn!(
-                    wait_secs,
-                    sleep_secs, retries, "LLM provider rate limited with 429; backing off"
+                    status = %status,
+                    sleep_secs,
+                    retries,
+                    hint = %hint,
+                    "LLM provider rate limited or unavailable; backing off"
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
                 response = self
@@ -384,12 +400,16 @@ impl LlmClient {
                     .json(&request_body)
                     .send()
                     .await
-                    .context("LLM request retry after 429 failed")?;
+                    .context("LLM request retry failed")?;
             }
 
-            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS
+                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+            {
+                let status = response.status();
+                let err_text = response.text().await.unwrap_or_default();
                 bail!(
-                    "LLM provider rate limited request with HTTP 429 after {retries} backoff retries"
+                    "LLM provider failed with HTTP {status} after {retries} backoff retries: {err_text}"
                 );
             }
             if !response.status().is_success() {
@@ -408,6 +428,10 @@ impl LlmClient {
                 .next()
                 .context("LLM response contained no choices")?;
 
+            let round_tokens = envelope.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+            cumulative_tokens += round_tokens;
+            completed_rounds = round + 1;
+
             if let Some(content) = choice
                 .message
                 .content
@@ -418,6 +442,39 @@ impl LlmClient {
             }
 
             if choice.message.tool_calls.is_empty() {
+                let missing_calendar = !tools_used.contains("get_event_calendar");
+                let missing_signals = !tools_used.contains("get_supplier_signals");
+
+                if (missing_calendar || missing_signals) && round + 1 < max_rounds {
+                    let mut reminders = Vec::new();
+                    if missing_calendar {
+                        reminders.push(
+                            "`get_event_calendar` to check upcoming festive spikes or holidays",
+                        );
+                    }
+                    if missing_signals {
+                        reminders.push("`get_supplier_signals` to inspect supply chain bottlenecks or supplier disruptions");
+                    }
+                    info!(
+                        round,
+                        missing_calendar,
+                        missing_signals,
+                        "LLM stopped calling tools early without querying mandatory domain tools; prompting continuation"
+                    );
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": choice.message.content.as_deref().unwrap_or("")
+                    }));
+                    messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "Before finalizing your replenishment decision, you are REQUIRED to query: {}. Please invoke these tools now.",
+                            reminders.join(" and ")
+                        )
+                    }));
+                    continue;
+                }
+
                 info!(
                     round,
                     "LLM stopped calling tools; generating final decision"
@@ -467,10 +524,20 @@ impl LlmClient {
 
         // Final structured answer parsing with 1 retry on parse failure (Amendment #1)
         let parsed_action = self
-            .obtain_final_action(&mut messages, last_content, key)
+            .obtain_final_action(&mut messages, last_content, key, &mut cumulative_tokens)
             .await?;
         let mut sorted_tools: Vec<String> = tools_used.into_iter().collect();
         sorted_tools.sort();
+
+        info!(
+            sku_id = %ctx.base_decision.sku_id,
+            location_code = %ctx.base_decision.location_code,
+            rounds = completed_rounds,
+            estimated_tokens = self.config.estimate_per_call,
+            actual_tokens = cumulative_tokens,
+            delta = (cumulative_tokens as i64) - (self.config.estimate_per_call as i64),
+            "LLM tool-calling loop completed; actual token usage recorded against estimate"
+        );
 
         Ok((parsed_action, tool_calls_recorded, sorted_tools))
     }
@@ -480,6 +547,7 @@ impl LlmClient {
         messages: &mut Vec<serde_json::Value>,
         last_content: Option<String>,
         key: &str,
+        cumulative_tokens: &mut u32,
     ) -> Result<LlmActionProposal> {
         // Try parsing last content if available
         if let Some(action) = last_content
@@ -512,20 +580,32 @@ impl LlmClient {
             .context("LLM final decision request failed")?;
 
         let mut final_retries = 0;
-        while response.status() == StatusCode::TOO_MANY_REQUESTS && final_retries < 3 {
+        while (response.status() == StatusCode::TOO_MANY_REQUESTS
+            || response.status() == StatusCode::SERVICE_UNAVAILABLE)
+            && final_retries < 4
+        {
             final_retries += 1;
-            let wait_secs = response
+            let status = response.status();
+            let retry_header = response
                 .headers()
                 .get("retry-after")
                 .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(3);
-            let sleep_secs = (wait_secs + 3).clamp(3, 30);
+                .map(|s| s.to_owned());
+            let err_body = response.text().await.unwrap_or_default();
+            let sleep_secs = parse_retry_delay(retry_header.as_deref(), &err_body, final_retries);
+            let hint = err_body
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(150)
+                .collect::<String>();
             warn!(
-                wait_secs,
+                status = %status,
                 sleep_secs,
                 final_retries,
-                "LLM provider rate limited on final decision with 429; backing off"
+                hint = %hint,
+                "LLM provider rate limited or unavailable on final decision; backing off"
             );
             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
             response = self
@@ -535,13 +615,20 @@ impl LlmClient {
                 .json(&request)
                 .send()
                 .await
-                .context("LLM final decision retry after 429 failed")?;
+                .context("LLM final decision retry failed")?;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_text = response.text().await.unwrap_or_default();
+            bail!("LLM final decision failed with HTTP {status}: {err_text}");
         }
 
         let envelope: ChatCompletionResponse = response
             .json()
             .await
             .context("LLM final decision response JSON failed")?;
+        *cumulative_tokens += envelope.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
         let content = envelope
             .choices
             .first()
@@ -586,6 +673,7 @@ impl LlmClient {
                     .json()
                     .await
                     .context("LLM final decision retry JSON failed")?;
+                *cumulative_tokens += retry_env.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
                 let retry_content = retry_env
                     .choices
                     .first()
@@ -634,6 +722,20 @@ impl LlmClient {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ChatUsage {
+    #[serde(default)]
+    #[allow(dead_code)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    #[allow(dead_code)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -654,6 +756,8 @@ struct ToolCallMessage {
     #[serde(rename = "type")]
     call_type: String,
     function: ToolCallFunction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,8 +767,16 @@ struct ToolCallFunction {
 }
 
 pub fn parse_action_json(value: &str) -> Result<LlmActionProposal> {
+    let clean = value.trim();
+    let json_str = if let Some(stripped) = clean.strip_prefix("```json") {
+        stripped.strip_suffix("```").unwrap_or(stripped).trim()
+    } else if let Some(stripped) = clean.strip_prefix("```") {
+        stripped.strip_suffix("```").unwrap_or(stripped).trim()
+    } else {
+        clean
+    };
     let proposal: LlmActionProposal =
-        serde_json::from_str(value).context("LLM action JSON parse failed")?;
+        serde_json::from_str(json_str).context("LLM action JSON parse failed")?;
     if proposal.summary.trim().is_empty()
         || proposal.key_points.is_empty()
         || !(0.0..=1.0).contains(&proposal.confidence)
@@ -672,6 +784,34 @@ pub fn parse_action_json(value: &str) -> Result<LlmActionProposal> {
         bail!("LLM action failed required field validation");
     }
     Ok(proposal)
+}
+
+pub fn parse_retry_delay(header_val: Option<&str>, body: &str, retries: u32) -> u64 {
+    if let Some(wait) = header_val.and_then(|s| s.parse::<u64>().ok()) {
+        return (wait + 2).clamp(3, 60);
+    }
+
+    if let Some(idx) = body.find("\"retryDelay\":") {
+        let snippet = &body[idx + 13..];
+        let digits: String = snippet
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(secs) = digits.parse::<u64>() {
+            return (secs + 3).clamp(3, 60);
+        }
+    }
+
+    if let Some(idx) = body.find("Please retry in ") {
+        let snippet = &body[idx + 16..];
+        let digits: String = snippet.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(secs) = digits.parse::<u64>() {
+            return (secs + 3).clamp(3, 60);
+        }
+    }
+
+    (2u64.pow(retries) * 4).clamp(4, 45)
 }
 
 fn deterministic_reasoning(decision: &ReorderDecision) -> LlmReasoning {
@@ -719,6 +859,15 @@ mod tests {
         assert_eq!(parsed.action, "REORDER");
         assert_eq!(parsed.reorder_quantity, 45);
         assert_eq!(parsed.confidence, 0.92);
+    }
+
+    #[test]
+    fn parse_action_json_accepts_markdown_code_blocks() {
+        let json = "```json\n{\n  \"action\": \"REORDER\",\n  \"reorder_quantity\": 500,\n  \"urgency\": \"HIGH\",\n  \"risk_level\": \"CRITICAL\",\n  \"summary\": \"Emergency restock\",\n  \"key_points\": [\"Out of stock\"],\n  \"confidence\": 0.95\n}\n```";
+        let parsed = parse_action_json(json).unwrap();
+        assert_eq!(parsed.action, "REORDER");
+        assert_eq!(parsed.reorder_quantity, 500);
+        assert_eq!(parsed.confidence, 0.95);
     }
 
     #[test]
@@ -826,6 +975,7 @@ mod tests {
             tool_call_timeout: std::time::Duration::from_secs(5),
             max_identical_tool_calls: 1,
             system_prompt: crate::config::default_system_prompt(),
+            ..LlmConfig::default()
         };
         let client = LlmClient::new(config);
         let balance = InventoryBalanceState {
@@ -874,6 +1024,7 @@ mod tests {
             feature_state: None,
             base_decision: &decision,
             timeout: std::time::Duration::from_millis(100),
+            macro_cache: None,
         };
 
         let result = client.propose_with_tools(&ctx, &balance).await;
@@ -883,5 +1034,28 @@ mod tests {
             Some(LlmFallbackReason::ProviderError)
         );
         assert!(client.status().await.circuit_open);
+    }
+
+    #[test]
+    fn parse_retry_delay_prefers_http_retry_after_header() {
+        assert_eq!(parse_retry_delay(Some("10"), "{}", 1), 12);
+    }
+
+    #[test]
+    fn parse_retry_delay_extracts_google_retry_delay_from_body() {
+        let body = r#"{"error":{"message":"Quota exceeded. Please retry in 25.64s.","details":[{"@type":"...RetryInfo","retryDelay":"25s"}]}}"#;
+        assert_eq!(parse_retry_delay(None, body, 1), 28);
+    }
+
+    #[test]
+    fn parse_retry_delay_falls_back_to_message_retry_hint() {
+        let body = r#"{"error":{"message":"Quota exceeded. Please retry in 20s."}}"#;
+        assert_eq!(parse_retry_delay(None, body, 1), 23);
+    }
+
+    #[test]
+    fn parse_retry_delay_falls_back_to_exponential_backoff() {
+        assert_eq!(parse_retry_delay(None, "{}", 1), 8);
+        assert_eq!(parse_retry_delay(None, "{}", 2), 16);
     }
 }

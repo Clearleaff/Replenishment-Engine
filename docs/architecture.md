@@ -71,6 +71,9 @@ flowchart LR
 The feature engine keeps Reserve pressure separate from finalized Sale demand. Historical weekday/hour learning is updated from finalized event-time buckets, so repeated calculations do not overweight the same observation.
 
 ## Agent Decision Flow
+## Agent Decision Flow (Hybrid Orchestrator)
+
+The decision engine operates via the `hybrid-orchestrator`, implementing an autonomous multi-turn tool-calling loop bounded by a deterministic safety firewall and governance policy:
 
 ```mermaid
 flowchart TD
@@ -80,9 +83,21 @@ flowchart TD
     Propose --> Governance[GOVERNANCE audit]
     Governance --> Policy[POLICY gate]
     Policy --> Execute[EXECUTE through Inventory API]
+    Ingress["RabbitMQ Event Ingress (:11098)"] --> Features["Real-Time Feature Engine (Sliding Windows)"]
+    Features --> LLM["LLM Decision Core (Groq / Gemini / OpenAI)"]
+    LLM <--> Tools["Deterministic Tools (ClickHouse / Stat Analysis / Sim)"]
+    LLM --> Firewall["Deterministic Safety Firewall"]
+    Firewall --> Policy["PolicyGate Governance"]
+    Policy --> Outcome{"Governance Classification"}
+    Outcome -- Low Risk --> Auto["Approved (LOG_ONLY Preflight)"]
+    Outcome -- Depleted Stock / High Risk --> Boss["RequiresHumanApproval (Boss Desk :5005)"]
+    Outcome -- Invalid / Zero --> Reject["Rejected"]
 ```
 
 The LLM boundary is purpose-built. It receives deterministic decision and simulation outputs and returns validated structured reasoning. It does not receive generic SQL, database access, filesystem access, shell access, arbitrary HTTP, or direct Inventory write access.
+The LLM is given 8 callable deterministic tools (including ClickHouse `event_calendar` for Indian festive surges and `supplier_disruption_signals` for freight delays). All arithmetic and warehouse queries execute deterministically in Rust. The `SafetyFirewall` validates capacity bounds and elevates stockout risk to at least `MEDIUM` to ensure that depleted stock is never auto-approved without human review.
+
+For complete deep-dive specifications, see [src/RustDataPlatform/hybrid-orchestrator/ARCHITECTURE.md](../src/RustDataPlatform/hybrid-orchestrator/ARCHITECTURE.md).
 
 ## Governance State Machine
 

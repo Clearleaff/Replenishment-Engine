@@ -159,6 +159,7 @@ pub struct ToolExecutionContext<'a> {
     pub feature_state: Option<&'a Mutex<SkuLocationState>>,
     pub base_decision: &'a ReorderDecision,
     pub timeout: Duration,
+    pub macro_cache: Option<&'a crate::macro_cache::MacroSignalCache>,
 }
 
 pub async fn execute_tool(
@@ -333,11 +334,17 @@ pub async fn execute_tool(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(60) as u32;
 
-                let events = ctx
-                    .warehouse
-                    .query_event_calendar(location_code, days_ahead)
-                    .await
-                    .map_err(|e| format!("ClickHouse event_calendar query failed: {e}"))?;
+                let events = if let Some(cache) = ctx.macro_cache {
+                    cache
+                        .get_event_calendar(location_code, days_ahead, ctx.warehouse)
+                        .await
+                        .map_err(|e| format!("ClickHouse event_calendar query failed: {e}"))?
+                } else {
+                    ctx.warehouse
+                        .query_event_calendar(location_code, days_ahead)
+                        .await
+                        .map_err(|e| format!("ClickHouse event_calendar query failed: {e}"))?
+                };
                 Ok(json!(events))
             }
             "get_supplier_signals" => {
@@ -350,11 +357,17 @@ pub async fn execute_tool(
                     .and_then(|v| v.as_i64())
                     .map(|id| id as i32);
 
-                let signals = ctx
-                    .warehouse
-                    .query_supplier_signals(sku_id, location_code)
-                    .await
-                    .map_err(|e| format!("ClickHouse supplier_signals query failed: {e}"))?;
+                let signals = if let Some(cache) = ctx.macro_cache {
+                    cache
+                        .get_supplier_signals(sku_id, location_code, ctx.warehouse)
+                        .await
+                        .map_err(|e| format!("ClickHouse supplier_signals query failed: {e}"))?
+                } else {
+                    ctx.warehouse
+                        .query_supplier_signals(sku_id, location_code)
+                        .await
+                        .map_err(|e| format!("ClickHouse supplier_signals query failed: {e}"))?
+                };
                 Ok(json!(signals))
             }
             other => Err(format!("Unknown tool '{other}'")),
@@ -499,7 +512,7 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
                     "type": "object",
                     "properties": {
                         "location_code": { "type": "string", "description": "Warehouse location code" },
-                        "sku_id": { "type": "integer", "description": "Optional SKU ID filter; omit or set null for warehouse-wide signals" }
+                        "sku_id": { "type": ["integer", "null"], "description": "Optional SKU ID filter; pass null for warehouse-wide signals" }
                     },
                     "required": ["location_code"]
                 }
@@ -628,6 +641,7 @@ mod tests {
             feature_state: None,
             base_decision: &decision,
             timeout: Duration::from_millis(500),
+            macro_cache: None,
         };
 
         let result = execute_tool(
@@ -688,6 +702,7 @@ mod tests {
             feature_state: None,
             base_decision: &decision,
             timeout: Duration::from_millis(50),
+            macro_cache: None,
         };
 
         let result = execute_tool(

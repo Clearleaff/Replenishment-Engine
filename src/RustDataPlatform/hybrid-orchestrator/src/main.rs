@@ -1,10 +1,3 @@
-mod config;
-mod event_handler;
-mod llm_client;
-mod llm_tools;
-mod safety_firewall;
-mod state;
-
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -12,13 +5,15 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use hybrid_orchestrator::{
+    config::OrchestratorConfig,
+    event_handler,
+    state::{AppState, ApproveError},
+};
 use serde_json::json;
 use tokio::{signal, time};
 use tracing::{error, info};
 use uuid::Uuid;
-
-use config::OrchestratorConfig;
-use state::{AppState, ApproveError};
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let health = state.health().await;

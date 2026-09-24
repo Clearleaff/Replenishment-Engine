@@ -42,7 +42,7 @@ impl SafetyFirewall {
         balance: &InventoryBalanceState,
     ) -> FirewallOutcome {
         let raw_action = decision.action.trim().to_ascii_uppercase();
-        let action = if raw_action.contains("REORDER") {
+        let action = if raw_action.contains("REORDER") || raw_action.contains("RESTOCK") {
             "REORDER".to_owned()
         } else if raw_action.contains("WAIT") {
             "WAIT".to_owned()
@@ -125,6 +125,32 @@ impl SafetyFirewall {
             clamp_reason = format!(
                 "quantity {} exceeded max order budget limit {}; clamped",
                 original_qty, self.max_order_quantity
+            );
+        }
+
+        // Hard risk level safety check:
+        // A complete stockout (on_hand <= 0 or available <= 0) or stock at/below safety stock
+        // can NEVER be classified as LOW risk. Total stockout represents active operational depletion
+        // and requires at least MEDIUM risk (triggering human review in policy gate).
+        if (balance.on_hand <= 0
+            || balance.available <= 0
+            || balance.on_hand <= balance.safety_stock)
+            && current_decision
+                .risk_level
+                .trim()
+                .eq_ignore_ascii_case("LOW")
+        {
+            warn!(
+                sku_id = balance.sku_id,
+                location = %balance.location_code,
+                on_hand = balance.on_hand,
+                available = balance.available,
+                safety_stock = balance.safety_stock,
+                "safety firewall elevated risk_level from LOW to MEDIUM due to active stockout/deficit"
+            );
+            current_decision.risk_level = "MEDIUM".to_owned();
+            current_decision.reasoning.key_points.push(
+                "SAFETY_FIREWALL: Risk level elevated from LOW to MEDIUM because stock is at/below safety stock or depleted".to_owned(),
             );
         }
 
@@ -251,5 +277,43 @@ mod tests {
             firewall.validate(decision, &balance),
             FirewallOutcome::Rejected { .. }
         ));
+    }
+
+    #[test]
+    fn elevates_low_risk_to_medium_on_stockout() {
+        let firewall = SafetyFirewall::new(200);
+        let balance = sample_balance(0, 200); // Complete stockout: on_hand=0, available=0
+        let mut decision = sample_decision("REORDER", 50, 0.9);
+        decision.risk_level = "LOW".to_owned();
+
+        let outcome = firewall.validate(decision, &balance);
+        match outcome {
+            FirewallOutcome::Passed(res) => {
+                assert_eq!(res.risk_level, "MEDIUM");
+                assert!(
+                    res.reasoning
+                        .key_points
+                        .iter()
+                        .any(|k| k.contains("SAFETY_FIREWALL"))
+                );
+            }
+            _ => panic!("expected passed outcome with elevated risk level"),
+        }
+    }
+
+    #[test]
+    fn elevates_low_risk_to_medium_when_at_or_below_safety_stock() {
+        let firewall = SafetyFirewall::new(200);
+        let balance = sample_balance(10, 200); // safety_stock is 10, so on_hand <= safety_stock
+        let mut decision = sample_decision("REORDER", 30, 0.9);
+        decision.risk_level = "LOW".to_owned();
+
+        let outcome = firewall.validate(decision, &balance);
+        match outcome {
+            FirewallOutcome::Passed(res) => {
+                assert_eq!(res.risk_level, "MEDIUM");
+            }
+            _ => panic!("expected passed outcome with elevated risk level"),
+        }
     }
 }

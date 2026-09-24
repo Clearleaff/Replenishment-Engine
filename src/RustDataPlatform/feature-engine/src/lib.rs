@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc, Weekday};
 use data_platform_common::{
@@ -73,26 +73,33 @@ impl OnlineDemandModel {
     }
 
     pub fn observe_hourly_total(&mut self, hour: u32, units: f64, at: DateTime<Utc>) {
-        self.hour[hour as usize].observe(units, self.decay_alpha);
+        self.hour[(hour % 24) as usize].observe(units, self.decay_alpha);
         self.observation_count += 1;
         self.last_update = Some(at);
     }
 
-    pub fn observe_recent_rate(&mut self, units_per_day: f64, at: DateTime<Utc>) {
-        self.recent_rate_ewma = if self.recent_rate_ewma == 0.0 {
-            units_per_day
+    pub fn observe_recent_rate(&mut self, rate_units_per_day: f64, at: DateTime<Utc>) {
+        if self.recent_rate_ewma == 0.0 {
+            self.recent_rate_ewma = rate_units_per_day;
         } else {
-            0.35 * units_per_day + 0.65 * self.recent_rate_ewma
-        };
+            self.recent_rate_ewma =
+                0.35 * rate_units_per_day + (1.0 - 0.35) * self.recent_rate_ewma;
+        }
         self.last_update = Some(at);
     }
 
-    pub fn weekday_stat(&self, weekday: Weekday) -> &DecayedStat {
-        &self.weekday[weekday.num_days_from_monday() as usize]
-    }
-
-    pub fn hour_stat(&self, hour: u32) -> &DecayedStat {
-        &self.hour[hour as usize]
+    pub fn baseline(&self, at: DateTime<Utc>) -> f64 {
+        let weekday_stat = &self.weekday[at.weekday().num_days_from_monday() as usize];
+        let hourly_stat = &self.hour[at.hour() as usize];
+        if weekday_stat.observation_count > 0 && hourly_stat.observation_count > 0 {
+            0.65 * weekday_stat.mean + 0.35 * (hourly_stat.mean * 24.0)
+        } else if weekday_stat.observation_count > 0 {
+            weekday_stat.mean
+        } else if hourly_stat.observation_count > 0 {
+            hourly_stat.mean * 24.0
+        } else {
+            12.0
+        }
     }
 
     pub fn forecast(
@@ -102,21 +109,11 @@ impl OnlineDemandModel {
         velocity_15m: f64,
         velocity_1h: f64,
     ) -> AdaptiveForecast {
-        let weekday = self.weekday_stat(at.weekday());
-        let hour = self.hour_stat(at.hour());
-        let baseline = match (weekday.observation_count, hour.observation_count) {
-            (0, 0) => self.recent_rate_ewma.max(0.0),
-            (_, 0) => weekday.mean,
-            (0, _) => hour.mean * 24.0,
-            _ => 0.75 * weekday.mean + 0.25 * hour.mean * 24.0,
-        };
-        let weighted_recent = 0.55 * velocity_5m + 0.30 * velocity_15m + 0.15 * velocity_1h;
-        let recent = if weighted_recent > 0.0 {
-            if self.recent_rate_ewma > 0.0 {
-                0.75 * weighted_recent + 0.25 * self.recent_rate_ewma
-            } else {
-                weighted_recent
-            }
+        let weekday = &self.weekday[at.weekday().num_days_from_monday() as usize];
+        let baseline = self.baseline(at).max(0.0);
+        let live_recent = 0.55 * velocity_5m + 0.30 * velocity_15m + 0.15 * velocity_1h;
+        let recent = if live_recent > 0.0 {
+            live_recent
         } else {
             self.recent_rate_ewma
         };
@@ -213,18 +210,65 @@ struct TimedUnits {
     quantity: i32,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Duration for which movement IDs are retained for dedup.
+/// 10 minutes matches realistic AMQP redelivery and backoff ceilings.
+const MOVEMENT_DEDUP_WINDOW_MINUTES: i64 = 10;
+
+/// Hard cap on movement dedup buffer size per SKU-location.
+/// Even for extremely hot SKUs during a festive spike (e.g. 5,000 sales/min),
+/// this strictly caps heap growth to at most 500 * 32B = 16 KB per pair.
+const MOVEMENT_DEDUP_MAX_ENTRIES: usize = 500;
+
+/// Maximum number of day-slots tracked (8-day sliding window).
+const DAILY_SLOTS: usize = 8;
+
+/// Maximum number of hour-slots tracked (8 days × 24 hours).
+const HOURLY_SLOTS: usize = DAILY_SLOTS * 24;
+
+/// Time-windowed movement dedup entry: (occurred_at, movement_id).
+#[derive(Debug, Clone)]
+struct TimedMovementId {
+    at: DateTime<Utc>,
+    id: Uuid,
+}
+
+#[derive(Debug, Clone)]
 pub struct SkuLocationState {
     pub balance: Option<InventoryBalanceState>,
     pub model: OnlineDemandModel,
-    seen_movements: HashSet<Uuid>,
+    /// Bounded dedup: retains movement IDs seen in the last 10 minutes,
+    /// capped at MOVEMENT_DEDUP_MAX_ENTRIES (500).
+    seen_movements: VecDeque<TimedMovementId>,
     sales: VecDeque<TimedUnits>,
     reserves: VecDeque<TimedUnits>,
-    daily_sale_totals: HashMap<NaiveDate, i32>,
-    hourly_sale_totals: HashMap<(NaiveDate, u32), i32>,
-    finalized_daily_sale_dates: HashSet<NaiveDate>,
-    finalized_hourly_sale_buckets: HashSet<(NaiveDate, u32)>,
+    /// Fixed-size ring for daily sale totals (8-day window).
+    daily_sale_totals: [i32; DAILY_SLOTS],
+    daily_base_date: Option<NaiveDate>,
+    /// Fixed-size ring for hourly sale totals (192 hours).
+    hourly_sale_totals: [i32; HOURLY_SLOTS],
+    /// Bitmask: 1 bit per daily slot (8 bits = 1 byte).
+    finalized_daily_mask: u8,
+    /// Bitmask: 1 bit per hourly slot (192 bits = 24 bytes).
+    finalized_hourly_mask: [u8; 24],
     last_recent_rate_observation_at: Option<DateTime<Utc>>,
+}
+
+impl Default for SkuLocationState {
+    fn default() -> Self {
+        Self {
+            balance: None,
+            model: OnlineDemandModel::default(),
+            seen_movements: VecDeque::new(),
+            sales: VecDeque::new(),
+            reserves: VecDeque::new(),
+            daily_sale_totals: [0; DAILY_SLOTS],
+            daily_base_date: None,
+            hourly_sale_totals: [0; HOURLY_SLOTS],
+            finalized_daily_mask: 0,
+            finalized_hourly_mask: [0; 24],
+            last_recent_rate_observation_at: None,
+        }
+    }
 }
 
 impl SkuLocationState {
@@ -244,10 +288,41 @@ impl SkuLocationState {
         self.balance = Some(state);
     }
 
+    pub fn seen_movements_len(&self) -> usize {
+        self.seen_movements.len()
+    }
+
     pub fn apply_movement(&mut self, fact: &InventoryMovementFact) -> bool {
-        if !self.seen_movements.insert(fact.movement_id) {
+        // 1. Evict dedup entries older than the 10-minute time window
+        let dedup_cutoff = fact.occurred_at - Duration::minutes(MOVEMENT_DEDUP_WINDOW_MINUTES);
+        while self
+            .seen_movements
+            .front()
+            .is_some_and(|entry| entry.at < dedup_cutoff)
+        {
+            self.seen_movements.pop_front();
+        }
+
+        // 2. Enforce hard entry cap: prevent hot SKU festive spikes from growing memory unbounded
+        while self.seen_movements.len() >= MOVEMENT_DEDUP_MAX_ENTRIES {
+            self.seen_movements.pop_front();
+        }
+
+        // 3. Check for duplicate within the bounded window
+        if self
+            .seen_movements
+            .iter()
+            .any(|entry| entry.id == fact.movement_id)
+        {
             return false;
         }
+
+        // 4. Record movement ID
+        self.seen_movements.push_back(TimedMovementId {
+            at: fact.occurred_at,
+            id: fact.movement_id,
+        });
+
         let units = TimedUnits {
             at: fact.occurred_at,
             quantity: fact.quantity,
@@ -255,19 +330,40 @@ impl SkuLocationState {
         match fact.movement_type {
             InventoryMovementType::Sale => {
                 insert_event_time_ordered(&mut self.sales, units);
-                *self
-                    .daily_sale_totals
-                    .entry(fact.occurred_at.date_naive())
-                    .or_default() += fact.quantity;
-                *self
-                    .hourly_sale_totals
-                    .entry((fact.occurred_at.date_naive(), fact.occurred_at.hour()))
-                    .or_default() += fact.quantity;
+                let date = fact.occurred_at.date_naive();
+                let hour = fact.occurred_at.hour();
+                let day_slot = date.num_days_from_ce() as usize % DAILY_SLOTS;
+                let hour_slot = (day_slot * 24 + hour as usize) % HOURLY_SLOTS;
+
+                // Reset slot if the date has wrapped around
+                self.ensure_daily_slot_fresh(date, day_slot);
+
+                self.daily_sale_totals[day_slot] += fact.quantity;
+                self.hourly_sale_totals[hour_slot] += fact.quantity;
             }
             InventoryMovementType::Reserve => insert_event_time_ordered(&mut self.reserves, units),
             _ => {}
         }
         true
+    }
+
+    /// Ensure a daily slot is fresh for the given date. If the slot
+    /// was last used for a different date (wrap-around), zero it and
+    /// clear finalization flags.
+    fn ensure_daily_slot_fresh(&mut self, date: NaiveDate, _day_slot: usize) {
+        if let Some(base) = self.daily_base_date {
+            let days_since_base = (date - base).num_days();
+            if days_since_base >= DAILY_SLOTS as i64 {
+                // Window has advanced past all slots; full reset
+                self.daily_sale_totals = [0; DAILY_SLOTS];
+                self.hourly_sale_totals = [0; HOURLY_SLOTS];
+                self.finalized_daily_mask = 0;
+                self.finalized_hourly_mask = [0; 24];
+                self.daily_base_date = Some(date);
+            }
+        } else {
+            self.daily_base_date = Some(date);
+        }
     }
 
     pub fn calculate(&mut self, as_of: DateTime<Utc>) -> Option<SkuLocationFeatures> {
@@ -341,25 +437,71 @@ impl SkuLocationState {
 
     fn observe_finalized_history_buckets(&mut self, as_of: DateTime<Utc>) {
         let current_date = as_of.date_naive();
-        for (date, total) in self.daily_sale_totals.clone() {
-            if date >= current_date || total <= 0 || !self.finalized_daily_sale_dates.insert(date) {
+
+        // Finalize daily buckets from the fixed-size array
+        for offset in 0..DAILY_SLOTS {
+            let day_slot = offset;
+            let bit = 1u8 << day_slot;
+            // Skip if already finalized or zero total
+            if self.finalized_daily_mask & bit != 0 {
                 continue;
             }
-            self.model
-                .observe_daily_total(date.weekday(), total as f64, as_of);
+            let total = self.daily_sale_totals[day_slot];
+            if total <= 0 {
+                continue;
+            }
+            // We can only finalize a daily bucket if the slot represents a
+            // past date. We reconstruct the date from the slot index: find
+            // dates in the sales VecDeque that map to this slot and are before
+            // current_date.
+            if let Some(date) = self.find_date_for_daily_slot(day_slot, current_date) {
+                self.finalized_daily_mask |= bit;
+                self.model
+                    .observe_daily_total(date.weekday(), total as f64, as_of);
+            }
         }
 
-        let current_bucket = (current_date, as_of.hour());
-        for (bucket, total) in self.hourly_sale_totals.clone() {
-            if bucket >= current_bucket
-                || total <= 0
-                || !self.finalized_hourly_sale_buckets.insert(bucket)
-            {
+        // Finalize hourly buckets
+        let current_hour = as_of.hour();
+        for slot in 0..HOURLY_SLOTS {
+            let byte_idx = slot / 8;
+            let bit_idx = slot % 8;
+            let bit = 1u8 << bit_idx;
+            if self.finalized_hourly_mask[byte_idx] & bit != 0 {
                 continue;
             }
-            self.model
-                .observe_hourly_total(bucket.1, total as f64, as_of);
+            let total = self.hourly_sale_totals[slot];
+            if total <= 0 {
+                continue;
+            }
+            let slot_hour = (slot % 24) as u32;
+            let slot_day_offset = slot / 24;
+            if let Some(date) = self.find_date_for_daily_slot(slot_day_offset, current_date) {
+                let is_past =
+                    date < current_date || (date == current_date && slot_hour < current_hour);
+                if is_past {
+                    self.finalized_hourly_mask[byte_idx] |= bit;
+                    self.model
+                        .observe_hourly_total(slot_hour, total as f64, as_of);
+                }
+            }
         }
+    }
+
+    /// Find the actual NaiveDate that maps to a given daily slot index,
+    /// by scanning the sales VecDeque for an entry whose date has that
+    /// slot index and is before `before_date`.
+    fn find_date_for_daily_slot(
+        &self,
+        day_slot: usize,
+        before_date: NaiveDate,
+    ) -> Option<NaiveDate> {
+        self.sales
+            .iter()
+            .map(|entry| entry.at.date_naive())
+            .find(|date| {
+                date.num_days_from_ce() as usize % DAILY_SLOTS == day_slot && *date < before_date
+            })
     }
 }
 
@@ -575,5 +717,45 @@ mod tests {
         assert_eq!(first.daily_sales, 0);
         assert_eq!(second.daily_sales, 0);
         assert_eq!(state.model.observation_count, observations_after_first);
+    }
+
+    #[test]
+    fn hard_cap_limits_seen_movements_during_burst() {
+        let mut state = SkuLocationState::default();
+        let balance = InventoryBalanceState {
+            sku_id: 1,
+            location_code: "BOM".to_owned(),
+            on_hand: 5000,
+            reserved: 0,
+            available: 5000,
+            safety_stock: 100,
+            reorder_point: 200,
+            max_stock: 10000,
+            version: 1,
+            updated_at: Utc::now(),
+        };
+        state.apply_balance(balance);
+
+        let now = Utc::now();
+        // Send 700 movements within the 10-minute window
+        for i in 0..700 {
+            let fact = InventoryMovementFact {
+                movement_id: Uuid::new_v4(),
+                source_event_id: Uuid::new_v4(),
+                sku_id: 1,
+                location_code: "BOM".to_owned(),
+                order_id: Some(i),
+                movement_type: InventoryMovementType::Sale,
+                quantity: 1,
+                occurred_at: now + Duration::seconds(i as i64),
+                recorded_at: now,
+                resulting_balance_version: (i + 2) as i64,
+                reason: None,
+            };
+            assert!(state.apply_movement(&fact));
+        }
+
+        // Must be capped at exactly 500 entries, preventing unbounded heap growth
+        assert_eq!(state.seen_movements.len(), 500);
     }
 }

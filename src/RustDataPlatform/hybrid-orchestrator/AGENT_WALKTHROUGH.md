@@ -1,35 +1,65 @@
 # Hybrid Orchestrator Walkthrough
 
 This document explains the hybrid orchestrator as it exists after hardening. It is written to be honest: this crate is now a safer bridge, but it is not yet the authoritative restock executor.
+This document provides a code-level walkthrough of the `hybrid-orchestrator` crate, explaining how it evolved into an autonomous LLM-driven decision core with deterministic tool calling and governance.
 
 ## Mental model
+---
+
+## 1. Mental Model of the Runtime Pipeline
 
 ```text
 RabbitMQ event
+RabbitMQ Ingress Event (OrderStockConfirmedIntegrationEvent)
     ↓
 validate payload
+Payload Invariant Validation (0 <= reserved <= on_hand <= max_stock)
     ↓
 require balance snapshot
+Authoritative Balance Snapshot Verification (Refuse to fabricate stock)
     ↓
 feature-engine calculates demand/forecast features
+feature-engine: Calculate sliding-window demand features (5m, 15m, 1h, EWMA)
     ↓
 replenishment-agent creates deterministic reorder decision
+llm_client: propose_with_tools() (Autonomous Multi-Turn Tool Calling)
+    ├── Tool 1: get_inventory_snapshot
+    ├── Tool 2: get_demand_features
+    ├── Tool 3: get_demand_forecast
+    ├── Tool 4: get_event_calendar (MANDATORY: Festivals & Promotions)
+    ├── Tool 5: get_supplier_signals (MANDATORY: Freight & Port Disruptions)
+    ├── Tool 6: simulate_reorder (Grid-search capacity simulation)
+    ├── Tool 7: get_historical_sales (ClickHouse daily movements)
+    └── Tool 8: run_statistical_analysis (Pure Rust numerical math)
     ↓
 simulation engine compares candidate quantities
+Rust-Side Continuation Guard: Verify get_event_calendar & get_supplier_signals
     ↓
 LLM reasoner explains only; it does not decide
+SafetyFirewall: Deterministic Post-Processing
+    ├── Capacity clamping: qty <= max(0, max_stock - on_hand)
+    ├── Budget clamping: qty <= 5,000
+    └── Deterministic Stockout Governance: on_hand <= 0 elevates LOW risk to MEDIUM
     ↓
 PolicyGate decides auto / human / reject
+PolicyGate: Rule-Based Governance Classification
+    ├── Low Risk -> AutoApproved (LOG_ONLY preflight)
+    ├── Medium / High Risk -> RequiresHumanApproval (Held for Boss Desk)
+    └── Zero Qty / Non-Reorder -> Rejected
     ↓
 proposal is stored in memory
+ProposalRecord Stored in AppState
     ↓
 HTTP Boss Desk can inspect and approve
     ↓
 LOG_ONLY command preview is returned
+Axum HTTP API (:5005): Boss Desk Operator Review & Approval
 ```
 
+---
 
 ## Architecture diagram
+## 2. Key Code Modules & Responsibilities
 
 ```mermaid
 flowchart TB
@@ -38,6 +68,15 @@ flowchart TB
         Rabbit[(RabbitMQ)]
         Human[Human operator]
     end
+| File | Primary Responsibility |
+| :--- | :--- |
+| [`src/main.rs`](src/main.rs) | Boots the Axum HTTP server on port `5005`, initializes `AppState`, binds RabbitMQ consumer, and coordinates graceful OS signal handling (`tokio::select!`). |
+| [`src/config.rs`](src/config.rs) | Multi-provider resolution (`groq`, `gemini`, `openai`, `disabled`), model aliasing, timeout/round parameters, and `default_system_prompt()`. |
+| [`src/llm_tools.rs`](src/llm_tools.rs) | Compacted OpenAI-compatible tool schemas (808 prompt tokens), `execute_tool()` router, ClickHouse queries, and `ToolLoopGuard`. |
+| [`src/llm_client.rs`](src/llm_client.rs) | Multi-turn tool execution loop, mandatory domain tool continuation guard, Google/Groq retry delay parser, adaptive backoff, and circuit breaker. |
+| [`src/safety_firewall.rs`](src/safety_firewall.rs) | Deterministic post-LLM validation: capacity clamping, budget limits, action normalization (`RESTOCK` synonym), and stockout risk elevation. |
+| [`src/state.rs`](src/state.rs) | Thread-safe partitioned `AppState` (`Arc<Mutex<T>>` buckets), ClickHouse warehouse client, and proposal lifecycle management. |
+| [`src/event_handler.rs`](src/event_handler.rs) | AMQP consumer loop, payload validation, feature calculation delegation, and `PolicyGate` outcome routing. |
 
     subgraph Hybrid[hybrid-orchestrator]
         Main[main.rs]
@@ -45,6 +84,7 @@ flowchart TB
         State[state.rs / AppState]
         Api[Axum Boss Desk API]
     end
+---
 
     subgraph Platform[Existing RustDataPlatform crates]
         Feature[feature-engine]
@@ -52,6 +92,7 @@ flowchart TB
         Policy[PolicyGate]
         Sim[SimulationEngine]
     end
+## 3. What Was Changed & Why
 
     Producer --> Rabbit
     Rabbit --> Handler
@@ -65,8 +106,21 @@ flowchart TB
     Agent --> Policy
     Human --> Api
 ```
+1. **Autonomous Tool Calling Replacing Static Formulas:**
+   - Previous versions used hardcoded formulas or advisory LLM explanations where the LLM had no data-query capabilities.
+   - The current engine gives the LLM 8 deterministic tools. The LLM autonomously inspects real-time demand, forecasts, festival calendars, and supplier disruptions to decide replenishment actions.
+2. **Mandatory Domain Tool Enforcement:**
+   - Small models (20b/Qwen) occasionally exited early after querying demand forecasts, skipping Indian festive calendars and supplier disruption signals.
+   - The Rust tool loop now inspects `tools_used`. If `get_event_calendar` or `get_supplier_signals` was skipped, the loop prompts the model to query them before synthesizing the final decision.
+3. **Deterministic Stockout Governance in Safety Firewall:**
+   - When inventory is completely depleted (`on_hand: 0`), classifying the decision as `LOW` risk would trigger `AUTO_APPROVED`, silently ordering stock without human review.
+   - The firewall elevates `LOW` risk to `MEDIUM` on active stockouts, guaranteeing that `PolicyGate` routes the proposal to `RequiresHumanApproval`.
+4. **Token Compaction & Rate Limit Hardening:**
+   - Compacted tool definitions by 60% (from ~2,000 to 808 prompt tokens) to fit within Groq's 8,000 TPM limit.
+   - Built custom `parse_retry_delay` extracting Google AI Studio and Groq backoff timings directly from JSON error bodies and HTTP headers.
 
 ## Runtime flow diagram
+---
 
 ```mermaid
 flowchart TD
@@ -93,6 +147,7 @@ flowchart TD
     O2 --> P
     O3 --> P
 ```
+## 4. Test Verification Checkpoint
 
 For the longer sequence/state diagrams, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -256,9 +311,12 @@ Important safety rules:
 
 ```bash
 cd src/RustDataPlatform
+cd /home/cleaff/eShop/src/RustDataPlatform
 cargo fmt --all --check
 cargo test -p hybrid-orchestrator
 cargo clippy -p hybrid-orchestrator --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
 ```
 
 Result:
@@ -328,3 +386,5 @@ Current result after hardening: 8 tests passed, including:
 - LLM JSON schema parser test.
 - Circuit breaker fallback test when provider is unavailable.
 - Policy boundary rejection test for exaggerated LLM order quantity.
+- **66 tests pass** across the entire workspace (31 in `hybrid-orchestrator`).
+- Zero formatting diffs and zero Clippy warnings.

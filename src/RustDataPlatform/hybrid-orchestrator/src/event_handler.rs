@@ -5,7 +5,10 @@ use feature_engine::SkuLocationFeatures;
 use futures::StreamExt;
 use lapin::{
     Connection, ConnectionProperties,
-    options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, QueueDeclareOptions},
+    options::{
+        BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions,
+        QueueDeclareOptions,
+    },
     types::FieldTable,
 };
 use replenishment_agent::{
@@ -112,7 +115,7 @@ impl InventoryBalancePayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum HandleOutcome {
+pub enum HandleOutcome {
     NoAction,
     ProposalStored,
     AutoApprovedPrepared,
@@ -121,7 +124,7 @@ enum HandleOutcome {
 }
 
 #[derive(Debug)]
-enum HandlerError {
+pub enum HandlerError {
     Poison(anyhow::Error),
     Transient(anyhow::Error),
 }
@@ -155,22 +158,16 @@ pub async fn start_consumer(state: AppState) -> Result<()> {
 
 async fn connect_with_retry(state: &AppState) -> Result<Connection> {
     let url = state.config.amqp_url.clone();
-    let strategy = ExponentialBackoff::from_millis(500)
-        .factor(2)
-        .max_delay(state.config.amqp_max_retry_delay);
-    Retry::start(strategy, move || {
-        let url = url.clone();
-        async move {
-            Connection::connect(&url, ConnectionProperties::default())
-                .await
-                .map_err(|error| {
-                    warn!(?error, "RabbitMQ not ready yet; retrying AMQP connection");
-                    error
-                })
-        }
+    let retry_strategy = ExponentialBackoff::from_millis(250)
+        .max_delay(state.config.amqp_max_retry_delay)
+        .take(10);
+
+    Retry::start(retry_strategy, || async {
+        info!("connecting to RabbitMQ");
+        Connection::connect(&url, ConnectionProperties::default()).await
     })
     .await
-    .context("connecting to RabbitMQ failed after retry")
+    .context("connecting to RabbitMQ after retries failed")
 }
 
 async fn consume_until_disconnect(conn: Connection, state: AppState) -> Result<()> {
@@ -178,6 +175,7 @@ async fn consume_until_disconnect(conn: Connection, state: AppState) -> Result<(
         .create_channel()
         .await
         .context("creating RabbitMQ channel failed")?;
+
     channel
         .queue_declare(
             &state.config.queue_name,
@@ -190,6 +188,11 @@ async fn consume_until_disconnect(conn: Connection, state: AppState) -> Result<(
         .await
         .context("declaring hybrid orchestrator queue failed")?;
 
+    channel
+        .basic_qos(state.config.amqp_prefetch, BasicQosOptions::default())
+        .await
+        .context("setting AMQP basic_qos prefetch failed")?;
+
     let mut consumer = channel
         .basic_consume(
             &state.config.queue_name,
@@ -200,62 +203,89 @@ async fn consume_until_disconnect(conn: Connection, state: AppState) -> Result<(
         .await
         .context("subscribing RabbitMQ consumer failed")?;
 
-    info!(queue = %state.config.queue_name, "subscribed to RabbitMQ queue");
+    info!(
+        queue = %state.config.queue_name,
+        prefetch = state.config.amqp_prefetch,
+        "subscribed to RabbitMQ queue with basic_qos"
+    );
 
     while let Some(delivery) = consumer.next().await {
         let delivery = delivery.context("RabbitMQ delivery error")?;
         state.incr(|metrics| metrics.deliveries_seen += 1).await;
+        let task_state = state.clone();
 
-        let event =
-            match serde_json::from_slice::<OrderStockConfirmedIntegrationEvent>(&delivery.data) {
-                Ok(event) => event,
-                Err(error) => {
-                    warn!(?error, "rejecting malformed order-stock-confirmed payload");
-                    state.incr(|metrics| metrics.invalid_events += 1).await;
-                    delivery
-                        .nack(BasicNackOptions {
-                            multiple: false,
-                            requeue: false,
-                        })
-                        .await?;
-                    continue;
-                }
-            };
+        let handle = tokio::spawn(async move {
+            process_delivery(delivery, task_state).await;
+        });
 
-        match handle_event(event, state.clone()).await {
-            Ok(HandleOutcome::Duplicate) => {
-                delivery.ack(BasicAckOptions::default()).await?;
-            }
-            Ok(outcome) => {
-                info!(?outcome, "event processed");
-                delivery.ack(BasicAckOptions::default()).await?;
-            }
-            Err(error) => {
-                let requeue = error.requeue();
-                match &error {
-                    HandlerError::Poison(inner) => {
-                        warn!(?inner, "poison message rejected without requeue")
-                    }
-                    HandlerError::Transient(inner) => error!(
-                        ?inner,
-                        "transient processing error; message will be requeued"
-                    ),
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                if join_err.is_panic() {
+                    warn!(?join_err, "spawned per-delivery task panicked");
                 }
-                state.incr(|metrics| metrics.processing_errors += 1).await;
-                delivery
-                    .nack(BasicNackOptions {
-                        multiple: false,
-                        requeue,
-                    })
-                    .await?;
             }
-        }
+        });
     }
 
     Err(anyhow!("RabbitMQ consumer stream ended"))
 }
 
-async fn handle_event(
+async fn process_delivery(delivery: lapin::message::Delivery, state: AppState) {
+    let event = match serde_json::from_slice::<OrderStockConfirmedIntegrationEvent>(&delivery.data) {
+        Ok(event) => event,
+        Err(error) => {
+            warn!(?error, "rejecting malformed order-stock-confirmed payload");
+            state.incr(|metrics| metrics.invalid_events += 1).await;
+            if let Err(e) = delivery
+                .nack(BasicNackOptions {
+                    multiple: false,
+                    requeue: false,
+                })
+                .await
+            {
+                warn!(?e, "failed to NACK malformed payload");
+            }
+            return;
+        }
+    };
+
+    match handle_event(event, state.clone()).await {
+        Ok(HandleOutcome::Duplicate) => {
+            if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                warn!(?e, "failed to ACK duplicate event delivery");
+            }
+        }
+        Ok(outcome) => {
+            info!(?outcome, "event processed");
+            if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                warn!(?e, "failed to ACK processed delivery");
+            }
+        }
+        Err(error) => {
+            let requeue = error.requeue();
+            match &error {
+                HandlerError::Poison(inner) => {
+                    warn!(?inner, "poison message rejected without requeue");
+                }
+                HandlerError::Transient(inner) => {
+                    error!(?inner, "transient processing error; message will be requeued");
+                }
+            }
+            state.incr(|metrics| metrics.processing_errors += 1).await;
+            if let Err(e) = delivery
+                .nack(BasicNackOptions {
+                    multiple: false,
+                    requeue,
+                })
+                .await
+            {
+                warn!(?e, "failed to NACK failed delivery");
+            }
+        }
+    }
+}
+
+pub async fn handle_event(
     event: OrderStockConfirmedIntegrationEvent,
     state: AppState,
 ) -> std::result::Result<HandleOutcome, HandlerError> {
@@ -268,7 +298,8 @@ async fn handle_event(
         return Ok(HandleOutcome::Duplicate);
     }
 
-    let Some((features, balance, data_status)) = build_features(&event, &state).await? else {
+    let Some((features, balance, data_status)) =
+        build_features(&event, &state).await.map_err(HandlerError::transient)? else {
         state.incr(|metrics| metrics.feature_skips += 1).await;
         warn!(source_event_key = %event_key, "event missing balance snapshot; refusing to fabricate stock state");
         return Ok(HandleOutcome::NoAction);
@@ -276,12 +307,36 @@ async fn handle_event(
 
     state.incr(|metrics| metrics.events_processed += 1).await;
 
-    let agent = ReplenishmentAgent::new(ReplenishmentPolicyConfig::default(), AgentMode::Recommend);
-    let base_decision = agent.evaluate(&features, &balance, 0);
+    // Trigger filter: boolean routing gate only (no reorder quantity logic, no risk scoring, no auto-approval path)
+    let should_invoke_llm = features.forecast.spike_detected
+        || (balance.on_hand <= (balance.reorder_point as f64 * 1.2) as i32);
 
-    if !features.forecast.spike_detected && base_decision.recommended_quantity <= 0 {
+    if !should_invoke_llm {
+        state.incr(|metrics| metrics.llm_filter_skips += 1).await;
         return Ok(HandleOutcome::NoAction);
     }
+
+    // Only events that passed the trigger filter reach the LLM evaluation path
+    // Rate Limiter: proactive token-bucket admission gate sits between trigger filter and semaphore
+    if state.config.llm.provider != crate::config::LlmProvider::Disabled {
+        if let Err(crate::rate_limiter::RateLimiterError::QueueFull) =
+            state.rate_limiter.acquire().await
+        {
+            warn!(
+                sku_id = event.sku_id,
+                location = %event.location_code,
+                "LLM rate limiter queue is full; gracefully dropping event to protect memory and prevent 429 storms"
+            );
+            state
+                .incr(|metrics| metrics.llm_queue_overflow_drops += 1)
+                .await;
+            return Ok(HandleOutcome::NoAction);
+        }
+    }
+
+    // Only events that passed the trigger filter and rate limiter reach the LLM evaluation path
+    let agent = ReplenishmentAgent::new(ReplenishmentPolicyConfig::default(), AgentMode::Recommend);
+    let base_decision = agent.evaluate(&features, &balance, 0);
 
     let feature_state_val = state.get_feature_state(&balance.sku_location()).await;
     let feature_state_mutex = feature_state_val.map(Mutex::new);
@@ -293,9 +348,16 @@ async fn handle_event(
         feature_state: feature_state_mutex.as_ref(),
         base_decision: &base_decision,
         timeout: state.config.llm.tool_call_timeout,
+        macro_cache: Some(&state.macro_cache),
     };
 
-    let llm_decision = state.llm.propose_with_tools(&ctx, &balance).await;
+    // LLM_MAX_CONCURRENT semaphore permit acquired strictly around propose_with_tools call
+    let llm_decision = {
+        let _permit = state.llm_semaphore.acquire().await.map_err(|e| {
+            HandlerError::transient(anyhow!("LLM concurrency semaphore closed: {e}"))
+        })?;
+        state.llm.propose_with_tools(&ctx, &balance).await
+    };
     if let Some(reason) = llm_decision.fallback_reason {
         state
             .incr(|metrics| {
@@ -377,16 +439,6 @@ async fn handle_event(
         message,
         ttl: state.config.proposal_ttl,
     });
-
-    info!(
-        proposal_id = %record.proposal.proposal_id,
-        sku_id = record.proposal.sku_id,
-        location_code = %record.proposal.location_code,
-        quantity = record.proposal.quantity,
-        status = ?record.status,
-        data_status = ?record.data_status,
-        "proposal recorded"
-    );
     state.insert_proposal(record).await;
     state.incr(|metrics| metrics.proposals_created += 1).await;
 
@@ -396,52 +448,35 @@ async fn handle_event(
 async fn build_features(
     event: &OrderStockConfirmedIntegrationEvent,
     state: &AppState,
-) -> std::result::Result<
-    Option<(
-        SkuLocationFeatures,
-        InventoryBalanceState,
-        DataFreshnessStatus,
-    )>,
-    HandlerError,
-> {
-    let Some(payload) = &event.balance else {
+) -> Result<Option<(SkuLocationFeatures, InventoryBalanceState, DataFreshnessStatus)>> {
+    let Some(balance_payload) = &event.balance else {
         return Ok(None);
     };
 
-    let balance = payload.to_state(event);
-    if !balance.invariants_hold() {
-        return Err(HandlerError::poison(anyhow!(
-            "inventory balance invariants failed for sku={} location={}",
-            balance.sku_id,
-            balance.location_code
-        )));
-    }
-
+    let balance = balance_payload.to_state(event);
+    let key = balance.sku_location();
     let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
+
     let movement = InventoryMovementFact {
-        movement_id: Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            format!("{}:sale", event.source_event_key()).as_bytes(),
-        ),
+        movement_id: event.source_event_id(),
         source_event_id: event.source_event_id(),
         sku_id: event.sku_id,
-        location_code: event.location_code.trim().to_ascii_uppercase(),
+        location_code: key.location_code.clone(),
         order_id: Some(event.order_id),
         movement_type: InventoryMovementType::Sale,
         quantity: event.quantity_depleted,
         occurred_at,
         recorded_at: Utc::now(),
         resulting_balance_version: balance.version,
-        reason: Some("ORDER_STOCK_CONFIRMED".to_owned()),
+        reason: Some("OrderStockConfirmedIntegrationEvent".to_owned()),
     };
 
     let features = state
-        .update_features(balance.clone(), movement, Utc::now())
+        .update_features(balance.clone(), movement, occurred_at)
         .await
-        .ok_or_else(|| {
-            HandlerError::transient(anyhow!("feature calculation returned no balance state"))
-        })?;
-    let data_status = if payload.authoritative {
+        .ok_or_else(|| anyhow!("feature calculation failed for SKU {}", event.sku_id))?;
+
+    let data_status = if balance_payload.authoritative {
         DataFreshnessStatus::Final
     } else {
         DataFreshnessStatus::Unreconciled
@@ -472,6 +507,9 @@ fn candidate_quantities(
 mod tests {
     use super::*;
     use crate::{config::OrchestratorConfig, state::AppState};
+    use chrono::Datelike;
+    use data_platform_common::SkuLocation;
+    use feature_engine::SkuLocationState;
 
     fn event_with_balance(authoritative: bool) -> OrderStockConfirmedIntegrationEvent {
         OrderStockConfirmedIntegrationEvent {
@@ -524,5 +562,95 @@ mod tests {
         let event = event_with_balance(false);
         let (_, _, data_status) = build_features(&event, &state).await.unwrap().unwrap();
         assert_eq!(data_status, DataFreshnessStatus::Unreconciled);
+    }
+
+    #[tokio::test]
+    async fn trigger_filter_skips_when_stock_healthy_and_no_spike() {
+        let state = AppState::new(OrchestratorConfig::from_env());
+        let mut event = event_with_balance(true);
+        // on_hand = 100, reorder_point = 20: 100 > 20 * 1.2 (= 24). Healthy stock, no spike.
+        if let Some(balance) = &mut event.balance {
+            balance.on_hand = 100;
+            balance.reorder_point = 20;
+            balance.safety_stock = 10;
+        }
+
+        // Seed established baseline so this normal depletion is not flagged as an anomalous spike
+        let now = Utc::now();
+        let mut sku_state = SkuLocationState::default();
+        sku_state
+            .model
+            .observe_daily_total(now.weekday(), 2000.0, now);
+        state
+            .seed_feature_state(
+                SkuLocation {
+                    sku_id: event.sku_id,
+                    location_code: "NCR".to_owned(),
+                },
+                sku_state,
+            )
+            .await;
+
+        let outcome = handle_event(event, state.clone()).await.unwrap();
+        assert_eq!(outcome, HandleOutcome::NoAction);
+        let metrics = state.metrics().await;
+        assert_eq!(metrics.llm_filter_skips, 1);
+        assert_eq!(metrics.proposals_created, 0);
+    }
+
+    #[tokio::test]
+    async fn trigger_filter_triggers_when_stock_at_reorder_threshold() {
+        let state = AppState::new(OrchestratorConfig::from_env());
+        let mut event = event_with_balance(true);
+        // on_hand = 22, reorder_point = 20: 22 <= 20 * 1.2 (= 24). Within 20% of reorder point!
+        if let Some(balance) = &mut event.balance {
+            balance.on_hand = 22;
+            balance.reorder_point = 20;
+            balance.safety_stock = 10;
+        }
+
+        let outcome = handle_event(event, state.clone()).await.unwrap();
+        assert_ne!(outcome, HandleOutcome::NoAction);
+        let metrics = state.metrics().await;
+        assert_eq!(metrics.llm_filter_skips, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_drops_event_and_increments_metric() {
+        let mut config = OrchestratorConfig::from_env();
+        config.llm.provider = crate::config::LlmProvider::Groq;
+        config.llm.groq_tpm_budget = 1_000;
+        config.llm.estimate_per_call = 1_000;
+        config.llm.queue_max_depth = 1; // Only 1 waiter allowed in queue
+        let state = AppState::new(config);
+
+        // Pre-consume the budget so subsequent calls must queue
+        state.rate_limiter.acquire().await.unwrap();
+
+        // Spawn a task that fills the 1-slot wait queue
+        let state2 = state.clone();
+        let handle = tokio::spawn(async move {
+            let _ = state2.rate_limiter.acquire().await;
+        });
+
+        // Give the task a moment to enter the wait queue
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+        assert_eq!(state.rate_limiter.status().await.queue_depth, 1);
+
+        // Now send an event that passes the trigger filter (near reorder point)
+        let mut event = event_with_balance(true);
+        if let Some(balance) = &mut event.balance {
+            balance.on_hand = 15;
+            balance.reorder_point = 20;
+        }
+
+        let outcome = handle_event(event, state.clone()).await.unwrap();
+        assert_eq!(outcome, HandleOutcome::NoAction);
+
+        let metrics = state.metrics().await;
+        assert_eq!(metrics.llm_queue_overflow_drops, 1);
+        assert_eq!(metrics.proposals_created, 0);
+
+        handle.abort();
     }
 }

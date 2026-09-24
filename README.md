@@ -132,6 +132,7 @@ DATA_LAKE_ROOT=data-lake cargo run --manifest-path src/RustDataPlatform/Cargo.to
 ```
 
 See [docs/architecture.md](docs/architecture.md), [docs/rust-data-pipeline-walkthrough.md](docs/rust-data-pipeline-walkthrough.md), and [docs/replenishment-agent-walkthrough.md](docs/replenishment-agent-walkthrough.md) for the full architecture and implementation notes.
+See [docs/architecture.md](docs/architecture.md), [docs/rust-data-pipeline-walkthrough.md](docs/rust-data-pipeline-walkthrough.md), [docs/llm-decision-core-walkthrough.md](docs/llm-decision-core-walkthrough.md), and [src/RustDataPlatform/hybrid-orchestrator/README.md](src/RustDataPlatform/hybrid-orchestrator/README.md) for the full architecture, LLM decision core, and implementation notes.
 
 ### Optional: AI Chatbot with Microsoft Foundry
 
